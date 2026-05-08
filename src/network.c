@@ -4,7 +4,7 @@ char configured = 0;
 struct mdnsd *mdns = {0};
 NetInfo netinfo;
 
-void init_network(void) {
+void network_init(void) {
     if (configured) return;
 
     struct ifaddrs *ifa, *ifaddr;
@@ -26,9 +26,9 @@ void init_network(void) {
         if (ifa->ifa_flags & IFF_LOOPBACK) continue;
         struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
         strcpy(netinfo.intf[netinfo.count], ifa->ifa_name);
-        inet_ntop(AF_INET, &addr->sin_addr.s_addr, 
+        inet_ntop(AF_INET, &addr->sin_addr.s_addr,
             netinfo.ipaddr[netinfo.count], sizeof(*netinfo.ipaddr));
-        HAL_INFO("network", "Interface %s has address %s\n", 
+        HAL_INFO("network", "Interface %s has address %s\n",
             netinfo.intf[netinfo.count], netinfo.ipaddr[netinfo.count]);
         netinfo.count++;
     }
@@ -37,13 +37,13 @@ void init_network(void) {
     configured = 1;
 }
 
-int start_network(void) {
-    init_network();
+int network_start(void) {
+    network_init();
     if (!configured)
         return EXIT_FAILURE;
 
     if (app_config.mdns_enable)
-        start_mdns();
+        mdns_start();
 
     if (app_config.onvif_enable)
         start_onvif();
@@ -51,15 +51,15 @@ int start_network(void) {
     return EXIT_SUCCESS;
 }
 
-void stop_network(void) {
+void network_stop(void) {
     if (app_config.mdns_enable)
-        stop_mdns();
+        mdns_stop();
 
     if (app_config.onvif_enable)
         stop_onvif();
 }
 
-int start_mdns(void) {
+int mdns_start(void) {
     char hostname[71];
 
     if (!(mdns = mdnsd_start()))
@@ -77,7 +77,7 @@ int start_mdns(void) {
     }
 }
 
-void stop_mdns(void) {
+void mdns_stop(void) {
     if (mdns)
         mdnsd_stop(mdns);
 

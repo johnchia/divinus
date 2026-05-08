@@ -89,7 +89,7 @@ void *night_thread(void) {
     nightOn = 0;
 }
 
-int enable_night(void) {
+int night_enable(void) {
     int ret = EXIT_SUCCESS;
 
     if (nightOn) return ret;
@@ -111,7 +111,7 @@ int enable_night(void) {
     return ret;
 }
 
-void disable_night(void) {
+void night_disable(void) {
     if (!nightOn) return;
 
     nightOn = 0;

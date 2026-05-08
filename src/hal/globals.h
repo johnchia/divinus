@@ -2,6 +2,10 @@
 
 #include "types.h"
 
+#ifndef GIT_REV
+#define GIT_REV "unknown"
+#endif
+
 extern char graceful, keepRunning;
 extern char audioOn, recordOn;
 

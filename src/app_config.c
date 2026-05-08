@@ -4,7 +4,7 @@ const char *appconf_paths[] = {"./divinus.yaml", "/etc/divinus.yaml"};
 
 struct AppConfig app_config;
 
-static inline void open_app_config(FILE **file, const char *flags) {
+static inline void app_config_open(FILE **file, const char *flags) {
     const char **path = appconf_paths;
     char conf_path[PATH_MAX], exe_path[PATH_MAX];
     *file = NULL;
@@ -39,7 +39,7 @@ static inline void open_app_config(FILE **file, const char *flags) {
     }
 }
 
-void restore_app_config(void) {
+void app_config_restore(void) {
     char conf_path[PATH_MAX], exe_path[PATH_MAX];
 
     ssize_t exe_len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -67,10 +67,10 @@ void restore_app_config(void) {
     }
 }
 
-int save_app_config(void) {
+int app_config_save(void) {
     FILE *file;
 
-    open_app_config(&file, "w");
+    app_config_open(&file, "w");
     if (!file)
         HAL_ERROR("app_config", "Can't open config file for writing\n");
 
@@ -213,7 +213,7 @@ int save_app_config(void) {
     return EXIT_SUCCESS;
 }
 
-enum ConfigError parse_app_config(void) {
+enum ConfigError app_config_parse(void) {
     memset(&app_config, 0, sizeof(struct AppConfig));
 
     app_config.web_port = 8080;
@@ -284,7 +284,7 @@ enum ConfigError parse_app_config(void) {
     memset(&ini, 0, sizeof(struct IniConfig));
 
     FILE *file;
-    open_app_config(&file, "r");
+    app_config_open(&file, "r");
     if (!open_config(&ini, &file))  {
         printf("Can't find config divinus.yaml in:\n"
             "    ./divinus.yaml\n    /etc/divinus.yaml\n");

@@ -32,8 +32,8 @@
 
 extern time_t recordStartTime;
 
-int start_server();
-int stop_server();
+int server_start();
+int server_stop();
 
 void send_jpeg_to_client(char index, char *buf, ssize_t size);
 void send_mjpeg_to_client(char index, char *buf, ssize_t size);

@@ -104,7 +104,7 @@ void *http_post_thread(void) {
     return NULL;
 }
 
-void start_http_post_send() {
+void http_post_start() {
     pthread_attr_t thread_attr;
     pthread_attr_init(&thread_attr);
     size_t stacksize;
@@ -120,6 +120,6 @@ void start_http_post_send() {
     pthread_attr_destroy(&thread_attr);
 }
 
-void stop_http_post_send() {
+void http_post_stop() {
     pthread_join(httpPostPid, NULL);
 }

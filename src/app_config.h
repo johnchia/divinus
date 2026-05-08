@@ -119,6 +119,6 @@ struct AppConfig {
 };
 
 extern struct AppConfig app_config;
-enum ConfigError parse_app_config(void);
-void restore_app_config(void);
-int save_app_config(void);
+enum ConfigError app_config_parse(void);
+void app_config_restore(void);
+int app_config_save(void);

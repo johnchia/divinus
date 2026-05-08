@@ -17,9 +17,9 @@ typedef struct {
     char host[65];
 } NetInfo;
 
-void init_network(void);
-int start_network(void);
-void stop_network(void);
+void network_init(void);
+int network_start(void);
+void network_stop(void);
 
-int start_mdns(void);
-void stop_mdns(void);
+int mdns_start(void);
+void mdns_stop(void);

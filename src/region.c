@@ -35,7 +35,7 @@ void region_fill_formatted(char* str) {
             if (getifaddrs(&ifaddr) == -1) continue;
 
             for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
-            { 
+            {
                 if (EQUALS(ifa->ifa_name, "lo")) continue;
                 if (ifname[0] && !EQUALS(ifa->ifa_name, ifname)) continue;
                 if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_PACKET) continue;
@@ -43,7 +43,7 @@ void region_fill_formatted(char* str) {
 
                 struct rtnl_link_stats *stats = ifa->ifa_data;
                 char b[32];
-                sprintf(b, "R:%dKbps S:%dKbps", 
+                sprintf(b, "R:%dKbps S:%dKbps",
                     (stats->rx_bytes - rxb_l) / 1024, (stats->tx_bytes - txb_l) / 1024);
                 strcat(out, b);
                 opos += strlen(b);
@@ -51,7 +51,7 @@ void region_fill_formatted(char* str) {
                 txb_l = stats->tx_bytes;
                 break;
             }
-            
+
             freeifaddrs(ifaddr);
         }
         else if (str[ipos + 1] == 'C')
@@ -113,7 +113,7 @@ void region_fill_formatted(char* str) {
             strcat(out, "$");
             opos++;
         }
-        ipos++; 
+        ipos++;
     }
     strncpy(str, out, 80);
 }
@@ -260,7 +260,7 @@ int region_prepare_bitmap(char *path, hal_bitmap *bitmap) {
 
     if (bmpInfo.compression == 3 && fread(&bmpFields, 1, sizeof(bitmapfields), file) != sizeof(bitmapfields))
         HAL_ERROR("region", "Extracting the bitmap fields failed!\n");
-    
+
     bpp = bmpInfo.bitCount / 8;
     size = bmpInfo.width * abs(bmpInfo.height);
 
@@ -269,7 +269,7 @@ int region_prepare_bitmap(char *path, hal_bitmap *bitmap) {
     if (!(buffer = malloc(size * bpp)))
         HAL_ERROR("region", "Allocating the bitmap input memory failed!\n");
 
-    if (fread(buffer, 1, (unsigned int)(size * bpp), file) != 
+    if (fread(buffer, 1, (unsigned int)(size * bpp), file) !=
         (unsigned int)(size * bpp))
         HAL_ERROR("region", "Reading the bitmap image data failed!\n");
 
@@ -535,7 +535,7 @@ found_font:;
     }
 }
 
-int start_region_handler() {
+int region_start() {
     pthread_attr_t thread_attr;
     pthread_attr_init(&thread_attr);
     size_t stacksize;
@@ -551,6 +551,6 @@ int start_region_handler() {
     pthread_attr_destroy(&thread_attr);
 }
 
-void stop_region_handler() {
+void region_stop() {
     pthread_join(regionPid, NULL);
 }

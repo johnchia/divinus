@@ -857,8 +857,8 @@ void respond_request(http_request_t *req) {
                 }
             }
 
-            disable_audio();
-            if (app_config.audio_enable) enable_audio();
+            media_audio_disable();
+            if (app_config.audio_enable) media_audio_enable();
         }
 
         respLen = sprintf(response,
@@ -884,7 +884,7 @@ void respond_request(http_request_t *req) {
                 char *key = split(&value, "=");
                 if (!key || !*key) continue;
                 if (EQUALS(key, "save")) {
-                    result = save_app_config();
+                    result = app_config_save();
                     if (!result)
                         HAL_INFO("server", "Configuration saved!\n");
                     else
@@ -1028,8 +1028,8 @@ void respond_request(http_request_t *req) {
                 }
             }
 
-            disable_mjpeg();
-            if (app_config.mjpeg_enable) enable_mjpeg();
+            media_mjpeg_disable();
+            if (app_config.mjpeg_enable) media_mjpeg_enable();
         }
 
         char mode[5] = "\0";
@@ -1108,8 +1108,8 @@ void respond_request(http_request_t *req) {
                 }
             }
 
-            disable_mp4();
-            if (app_config.mp4_enable) enable_mp4();
+            media_mp4_disable();
+            if (app_config.mp4_enable) media_mp4_enable();
         }
 
         char h265[6] = "false";
@@ -1201,8 +1201,8 @@ void respond_request(http_request_t *req) {
                 }
             }
 
-            disable_night();
-            if (app_config.night_mode_enable) enable_night();
+            night_disable();
+            if (app_config.night_mode_enable) night_enable();
         }
         respLen = sprintf(response,
             "HTTP/1.1 200 OK\r\n"
@@ -1625,7 +1625,7 @@ void *server_thread(void *vargp) {
     return NULL;
 }
 
-int start_server() {
+int server_start() {
     for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
         client_fds[i].sockFd = -1;
         client_fds[i].type = -1;
@@ -1653,7 +1653,7 @@ int start_server() {
     return EXIT_SUCCESS;
 }
 
-int stop_server() {
+int server_stop() {
     keepRunning = 0;
 
     close_socket_fd(server_fd);
