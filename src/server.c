@@ -87,23 +87,55 @@ void free_client(int i) {
 
 int send_to_fd(int fd, char *buf, ssize_t size) {
     if (fd < 0) return -1;
-    ssize_t sent = send(fd, buf, size, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (sent < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        return -1;
+
+    ssize_t total = 0;
+    for (int attempts = 0; attempts < 4; attempts++) {
+        ssize_t n = send(fd, buf + total, size - total, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0) {
+            total += n;
+            attempts = -1;
+        } else if (n == 0) return -1;
+        else if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+
+        if (total == size) return EXIT_SUCCESS;
+
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (poll(&pfd, 1, 25) < 0) return -1;
     }
-    return EXIT_SUCCESS;
+
+    return -1;
 }
 
 int sendv_to_client(int i, struct iovec *iov, int iovcnt) {
-    ssize_t n = writev(client_fds[i].sockFd, iov, iovcnt);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        if (errno == EINTR) return 0;
-        free_client(i);
-        return -1;
+    int fd = client_fds[i].sockFd;
+    if (fd < 0) return -1;
+
+    for (int attempts = 0; attempts < 4; attempts++) {
+        ssize_t n = writev(fd, iov, iovcnt);
+        if (n > 0) {
+            while (n > 0 && iovcnt > 0) {
+                if (n >= iov[0].iov_len) {
+                    n -= iov[0].iov_len;
+                    iov++;
+                    iovcnt--;
+                } else {
+                    iov[0].iov_base = (char *)iov[0].iov_base + n;
+                    iov[0].iov_len -= n;
+                    n = 0;
+                }
+            }
+            if (iovcnt == 0) return 0;
+            attempts = -1;
+        } else if (n == 0) goto error;
+        else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) goto error;
+
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (poll(&pfd, 1, 25) < 0) goto error;
     }
-    return 0;
+
+error:
+    free_client(i);
+    return -1;
 }
 
 int send_to_client(int i, char *buf, ssize_t size) {
@@ -424,11 +456,11 @@ int send_file(const int client_fd, const char *path) {
             len_size = sprintf(len_buf, "%zX\r\n", size);
             buf[size++] = '\r';
             buf[size++] = '\n';
-            send_to_fd(client_fd, len_buf, len_size); // send <SIZE>\r\n
-            send_to_fd(client_fd, buf, size);         // send <DATA>\r\n
+            if (send_to_fd(client_fd, len_buf, len_size) < 0) break;
+            if (send_to_fd(client_fd, buf, size) < 0) break;
         }
         char end[] = "0\r\n\r\n";
-        send_to_fd(client_fd, end, sizeof(end));
+        send_to_fd(client_fd, end, sizeof(end) - 1);
         fclose(file);
         close_socket_fd(client_fd);
         return EXIT_FAILURE;

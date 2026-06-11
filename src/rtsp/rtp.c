@@ -439,9 +439,17 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265)
     
     if (trans.list_head.list) {
         for (int i = 0; i < stream->count; i++) {
-            ASSERT(__transfer_nal_h26x(&(trans.list_head), 
-                stream->pack[i].data + stream->pack[i].offset, 
-                stream->pack[i].length - stream->pack[i].offset, h->isH265) == SUCCESS, goto error);
+            unsigned char *data = stream->pack[i].data + stream->pack[i].offset;
+            size_t length = stream->pack[i].length - stream->pack[i].offset;
+            if (length >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
+                unsigned char *nalptr = data;
+                size_t single_len = 0;
+                while (__split_nal(data, &nalptr, &single_len, length) == SUCCESS) {
+                    ASSERT(__transfer_nal_h26x(&(trans.list_head), nalptr, single_len, h->isH265) == SUCCESS, goto error);
+                }
+            } else {
+                ASSERT(__transfer_nal_h26x(&(trans.list_head), data, length, h->isH265) == SUCCESS, goto error);
+            }
         }
         ASSERT(list_map_inline(&(trans.list_head), (__rtcp_poll), &track_id) == SUCCESS, goto error);
     } 
