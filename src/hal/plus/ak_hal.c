@@ -119,7 +119,6 @@ void ak_pipeline_destroy(void)
 int ak_video_create(char index, hal_vidconfig *config)
 {
     int ret;
-
     ak_venc_codec codec;
     char ratemode;
     ak_venc_prof profile;
@@ -151,10 +150,10 @@ int ak_video_create(char index, hal_vidconfig *config)
 
     {
         ak_venc_cnf channel = {.codec = codec, .width = config->width, .height = config->height,
-            .minQual = MIN(MAX(config->minQual, 20), 50), 
-            .maxQual = MIN(MAX(config->maxQual ? config->maxQual : 50, 20), 50), 
-            .dstFps = config->framerate, .gop = config->gop, .maxBitrate = config->maxBitrate, 
-            .profile = profile, .subChnOn = index, 
+            .minQual = MIN(MAX(config->minQual, 20), 50),
+            .maxQual = MIN(MAX(config->maxQual ? config->maxQual : 50, 20), 50),
+            .dstFps = config->framerate, .gop = config->gop, .maxBitrate = config->maxBitrate,
+            .profile = profile, .subChnOn = index,
             .output = index ? AK_VENC_OUT_SUBSTRM : AK_VENC_OUT_MAINSTRM, .vbrModeOn = ratemode};
 
         if (!(_ak_venc_dev[index] = ak_venc.fnEnableChannel(&channel)))
@@ -247,7 +246,7 @@ int ak_system_init(char *snrConfig)
 
     // Disable the watchdog timer if it isn't already
     hal_registry(0x080080E8, &val, OP_WRITE);
-    
+
     if (ak_vi.fnLoadSensorConfig(snrConfig))
         HAL_DANGER("ak_vi", "Loading the sensor config failed"
             " with %#x!\n%s\n", ret = ak_sys.fnGetErrorNum(),

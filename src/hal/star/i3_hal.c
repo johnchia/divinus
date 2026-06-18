@@ -395,6 +395,7 @@ int i3_video_create(char index, hal_vidconfig *config)
     int ret;
     i3_venc_chn channel;
     i3_venc_attr_h26x *attrib;
+    memset(&channel, 0, sizeof(channel));
 
     if (config->codec == HAL_VIDCODEC_JPG || config->codec == HAL_VIDCODEC_MJPG) {
         channel.attrib.codec = I3_VENC_CODEC_MJPG;
@@ -410,7 +411,7 @@ int i3_video_create(char index, hal_vidconfig *config)
                 channel.rate.mode = series == 0xEF ? I3OG_VENC_RATEMODE_MJPGQP : I3_VENC_RATEMODE_MJPGQP;
                 channel.rate.mjpgQp.fpsNum =
                     config->codec == HAL_VIDCODEC_JPG ? 1 : config->framerate;
-                channel.rate.mjpgCbr.fpsDen = 1;
+                channel.rate.mjpgQp.fpsDen = 1;
                 channel.rate.mjpgQp.quality = MAX(config->minQual, config->maxQual);
                 break;
             default:

@@ -602,6 +602,7 @@ int v4_video_create(char index, hal_vidconfig *config)
     int ret;
     v4_venc_chn channel;
     memset(&channel, 0, sizeof(channel));
+
     channel.gop.mode = V4_VENC_GOPMODE_NORMALP;
     if (config->codec == HAL_VIDCODEC_JPG || config->codec == HAL_VIDCODEC_MJPG) {
         channel.attrib.codec = V4_VENC_CODEC_MJPG;

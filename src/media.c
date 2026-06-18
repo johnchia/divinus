@@ -566,7 +566,7 @@ int media_mp4_disable(void) {
 
     for (char i = 0; i < chnCount; i++) {
         if (!chnState[i].enable) continue;
-        if (chnState[i].payload != HAL_VIDCODEC_H264 ||
+        if (chnState[i].payload != HAL_VIDCODEC_H264 &&
             chnState[i].payload != HAL_VIDCODEC_H265) continue;
 
         if (ret = unbind_channel(i, 1))
