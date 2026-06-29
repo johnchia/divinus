@@ -807,15 +807,17 @@ void *rk_video_thread(void)
                             switch (rk_state[i].payload) {
                                 case HAL_VIDCODEC_H264:
                                     if (pack->naluType.h264Nalu != RK_VENC_NALU_H264_IDRSLICE) {
-                                        signed char n = 0;
-                                        for (unsigned int p = 0; p < outPack[j].length - 4; p++) {
-                                            if (outPack[j].data[p] || outPack[j].data[p + 1] ||
-                                                outPack[j].data[p + 2] || outPack[j].data[p + 3] != 1) continue;
-                                            outPack[0].nalu[n].type = outPack[j].data[p + 4] & 0x1F;
-                                            outPack[0].nalu[n++].offset = p;
+                                        unsigned int n = 0, sc, scanOff = 0;
+                                        unsigned int pktLen = outPack[j].length;
+                                        while ((sc = nal_find_startcode(outPack[j].data, scanOff, pktLen)) < pktLen) {
+                                            unsigned int scLen = (outPack[j].data[sc + 2] == 1) ? 3 : 4;
+                                            outPack[0].nalu[n].type = outPack[j].data[sc + scLen] & 0x1F;
+                                            outPack[0].nalu[n].offset = sc;
+                                            n++;
+                                            scanOff = sc + scLen;
                                         }
                                         outPack[0].naluCnt = n;
-                                        outPack[0].nalu[n].offset = pack->length;
+                                        outPack[0].nalu[n].offset = pktLen;
                                         for (n = 0; n < outPack[0].naluCnt; n++)
                                             outPack[0].nalu[n].length =
                                                 outPack[0].nalu[n + 1].offset -

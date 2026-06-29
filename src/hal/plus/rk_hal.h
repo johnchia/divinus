@@ -11,6 +11,7 @@
 #include "rk_vpss.h"
 
 #include "../globals.h"
+#include "../../fmt/nal.h"
 
 #include <fcntl.h>
 #include <pthread.h>

@@ -137,7 +137,7 @@ void *gm_audio_thread(void)
                     (gm_aud_cb)(&outFrame);
                 }
             }
-        }        
+        }
     }
 abort:
     HAL_INFO("gm_venc", "Shutting down encoding thread...\n");
@@ -148,7 +148,7 @@ int gm_channel_bind(char index)
 {
     int ret;
 
-    _gm_venc_fds[index].bind = 
+    _gm_venc_fds[index].bind =
         gm_lib.fnBind(_gm_cap_grp, _gm_cap_dev, _gm_venc_dev[index]);
     _gm_venc_fds[index].evType = GM_POLL_READ;
 
@@ -228,7 +228,7 @@ void gm_region_destroy(char handle)
 }
 
 int gm_region_setbitmap(char handle, hal_bitmap *bitmap)
-{   
+{
     gm_osd_imgs bitmaps = {
         .image = {
             {
@@ -293,7 +293,7 @@ int gm_video_create(char index, hal_vidconfig *config)
                     break;
                 case HAL_VIDPROFILE_HIGH:
                     h264chn.profile = GM_VENC_H264PROF_HIGH;
-                    break;    
+                    break;
             }
             h264chn.level = 41;
             gm_lib.fnSetDeviceConfig(_gm_venc_dev[index], &h264chn);
@@ -419,25 +419,27 @@ void *gm_video_thread(void)
                 outPack[0].offset = 0;
                 outPack[0].timestamp = pack->timestamp;
 
-                signed char n = 0;
-                for (unsigned int p = 0; p < pack->bsSize - 4; p++) {
-                    if (pack->bsData[p] || pack->bsData[p + 1] ||
-                        pack->bsData[p + 2] || pack->bsData[p + 3] != 1) continue;
-                    outPack[0].nalu[n].type = pack->bsData[p + 4] & 0x1F;
-                    outPack[0].nalu[n++].offset = p;
-                    if (n == (pack->isKeyFrame ? 3 : 1)) break;
+                unsigned int n = 0, sc, scanOff = 0;
+                unsigned int pktLen = pack->bsSize;
+                while ((sc = nal_find_startcode(pack->bsData, scanOff, pktLen)) < pktLen) {
+                    unsigned int scLen = (pack->bsData[sc + 2] == 1) ? 3 : 4;
+                    outPack[0].nalu[n].type = pack->bsData[sc + scLen] & 0x1F;
+                    outPack[0].nalu[n].offset = sc;
+                    n++;
+                    scanOff = sc + scLen;
+                    if (n == (pack->isKeyFrame ? 3u : 1u)) break;
                 }
                 outPack[0].naluCnt = n;
-                outPack[0].nalu[n].offset = pack->bsSize;
+                outPack[0].nalu[n].offset = pktLen;
                 for (n = 0; n < outPack[0].naluCnt; n++)
-                    outPack[0].nalu[n].length = 
+                    outPack[0].nalu[n].length =
                         outPack[0].nalu[n + 1].offset -
                         outPack[0].nalu[n].offset;
 
                 outStrm.pack = outPack;
                 (*gm_vid_cb)(i, &outStrm);
             }
-        }        
+        }
     }
 abort:
     HAL_INFO("gm_venc", "Shutting down encoding thread...\n");

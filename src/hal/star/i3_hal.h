@@ -9,6 +9,7 @@
 #include "i3_vi.h"
 
 #include "../globals.h"
+#include "../../fmt/nal.h"
 
 #include <sys/select.h>
 #include <unistd.h>

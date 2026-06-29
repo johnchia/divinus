@@ -34,7 +34,19 @@ enum NalUnitType {                    //   Table 7-1 NAL unit type codes
     NalUnitType_SEI_HEVC_2 = 40,
 };
 
-char *nal_type_to_str(const enum NalUnitType nal_type);
+static inline unsigned int nal_find_startcode(const unsigned char *buf,
+    unsigned int off, unsigned int len)
+{
+    for (; off + 2 < len; off++) {
+        if (buf[off] == 0 && buf[off + 1] == 0) {
+            if (buf[off + 2] == 1)
+                return off;
+            if (off + 3 < len && buf[off + 2] == 0 && buf[off + 3] == 1)
+                return off;
+        }
+    }
+    return len;
+}
 
 struct NAL {
     char isH265;
@@ -48,7 +60,3 @@ struct NAL {
     uint8_t unit_type_value;
     enum NalUnitType unit_type;
 };
-
-void nal_parse_header(struct NAL *nal, const char first_byte);
-bool nal_chk4(const char *buf, const uint32_t offset);
-bool nal_chk3(const char *buf, const uint32_t offset);
