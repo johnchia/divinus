@@ -398,6 +398,7 @@ static int __message_proc_sock(struct list_t *e, void *p)
             ungetc(first_char, con->fp_tcp_read);
         } else {
             con->con_state = __CON_S_DISCONNECTED;
+            ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
             return SUCCESS;
         }
 
@@ -489,6 +490,7 @@ error:
                         ERR("unexpected empty request, forcing disconnect\n");
                         con->con_state = __CON_S_DISCONNECTED;
                     }
+                    ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
                     break;
                 default: ERR("unexpected method state\n"); return FAILURE;
             }

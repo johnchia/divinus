@@ -135,6 +135,15 @@ static int rtmp_send_packet(int message_type, int stream_id, const void *data, i
         if (remaining > 0) {
             uint8_t h = (3 << 6) | (cs_id & 0x3F);
             if (send_data(&h, 1) < 0) return -1;
+
+            if (timestamp >= 0xFFFFFF) {
+                uint8_t ext_ts[4];
+                ext_ts[0] = (timestamp >> 24) & 0xFF;
+                ext_ts[1] = (timestamp >> 16) & 0xFF;
+                ext_ts[2] = (timestamp >> 8) & 0xFF;
+                ext_ts[3] = timestamp & 0xFF;
+                if (send_data(ext_ts, 4) < 0) return -1;
+            }
         }
     }
     return 0;
