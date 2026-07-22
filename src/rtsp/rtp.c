@@ -457,7 +457,7 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_
         for (int i = 0; i < stream->count; i++) {
             unsigned char *data = stream->pack[i].data + stream->pack[i].offset;
             size_t length = stream->pack[i].length - stream->pack[i].offset;
-            if (length >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
+            if (__annexb_start_code(data, length)) {
                 unsigned char *nalptr = data;
                 size_t single_len = 0;
                 while (__split_nal(data, &nalptr, &single_len, length) == SUCCESS) {
