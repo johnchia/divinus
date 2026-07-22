@@ -94,7 +94,7 @@ substream:
   height: 576
   fps: 15
   gop: 15
-  bitrate: 1024
+  bitrate: 512
 
 jpeg:
   enable: false

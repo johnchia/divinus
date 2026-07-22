@@ -271,7 +271,7 @@ enum ConfigError app_config_parse(void) {
     app_config.substream_gop = 15;
     app_config.substream_width = 1024;
     app_config.substream_height = 576;
-    app_config.substream_bitrate = 1024;
+    app_config.substream_bitrate = 512;
 
     app_config.mjpeg_enable = false;
     app_config.mjpeg_fps = 15;
