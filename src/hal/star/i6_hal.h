@@ -34,6 +34,7 @@ int i6_channel_grayscale(char enable);
 int i6_channel_unbind(char index);
 
 int i6_config_load(char *path);
+int i6_iq_set(const char *name, int value);
 
 int i6_pipeline_create(char index, short width, short height, char mirror, char flip, char framerate);
 void i6_pipeline_destroy(void);

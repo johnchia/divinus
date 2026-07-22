@@ -82,6 +82,14 @@ int save_audio_stream(hal_audframe *frame) {
 int mp4_index = -1;
 int substream_index = -1;
 
+#if defined(__ARM_PCS_VFP)
+static void i6_apply_configured_iq(void)
+{
+    if (app_config.ae_ev_comp >= -10)
+        i6_iq_set("ae_ev_comp", app_config.ae_ev_comp);
+}
+#endif
+
 int save_video_stream(char index, hal_vidstream *stream) {
     int ret;
 
@@ -878,6 +886,11 @@ int sdk_start(void) {
             case HAL_PLATFORM_T31: t31_config_load(app_config.sensor_config); break;
 #endif
         }
+
+#if defined(__ARM_PCS_VFP)
+    if (plat == HAL_PLATFORM_I6)
+        i6_apply_configured_iq();
+#endif
 
     HAL_INFO("media", "SDK has started successfully!\n");
 

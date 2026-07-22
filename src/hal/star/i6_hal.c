@@ -221,6 +221,108 @@ int i6_config_load(char *path)
     return i6_isp.fnLoadChannelConfig(_i6_isp_chn, path, 1234);
 }
 
+typedef int (*i6_iq_fn)(unsigned int channel, void *config);
+
+enum i6_iq_type { I6_IQ_U8, I6_IQ_U16, I6_IQ_U32, I6_IQ_S32 };
+enum i6_iq_layout { I6_IQ_DIRECT, I6_IQ_BOOL, I6_IQ_MANUAL, I6_IQ_AUTO_MANUAL };
+
+typedef struct {
+    const char *name;
+    const char *get_symbol;
+    const char *set_symbol;
+    unsigned short offset;
+    int min;
+    int max;
+    enum i6_iq_type type;
+    enum i6_iq_layout layout;
+} i6_iq_param;
+
+/* EVComp is { signed EV bias, unsigned gradation }. Get before Set so the
+ * ISP-loaded gradation field is preserved. */
+static const i6_iq_param i6_iq_params[] = {
+    {"ae_ev_comp", "MI_ISP_AE_GetEVComp", "MI_ISP_AE_SetEVComp", 0, -10, 10,
+        I6_IQ_S32, I6_IQ_DIRECT},
+};
+
+int i6_iq_set(const char *name, int value)
+{
+    static unsigned char config[32768];
+    const i6_iq_param *param = NULL;
+    i6_iq_fn get, set;
+    int ret;
+
+    for (unsigned int i = 0; i < sizeof(i6_iq_params) / sizeof(i6_iq_params[0]); i++)
+        if (!strcmp(name, i6_iq_params[i].name)) {
+            param = &i6_iq_params[i];
+            break;
+        }
+    if (!param || value < param->min || value > param->max)
+        return EXIT_FAILURE;
+
+    get = (i6_iq_fn)dlsym(i6_isp.handle, param->get_symbol);
+    set = (i6_iq_fn)dlsym(i6_isp.handle, param->set_symbol);
+    if (!get || !set) {
+        HAL_WARNING("i6_iq", "%s is unavailable in this ISP library\n", name);
+        return EXIT_FAILURE;
+    }
+
+    memset(config, 0, sizeof(config));
+    if (ret = get(_i6_isp_chn, config)) {
+        HAL_WARNING("i6_iq", "Can't read %s: %#x\n", name, ret);
+        return ret;
+    }
+
+    if (param->layout != I6_IQ_DIRECT) {
+        unsigned int enabled = 1;
+        memcpy(config, &enabled, sizeof(enabled));
+    }
+    if (param->layout == I6_IQ_AUTO_MANUAL) {
+        unsigned int manual = 1;
+        memcpy(config + 4, &manual, sizeof(manual));
+    }
+    switch (param->type) {
+        case I6_IQ_U8: config[param->offset] = value; break;
+        case I6_IQ_U16: {
+            unsigned short v = value;
+            memcpy(config + param->offset, &v, sizeof(v));
+            break;
+        }
+        case I6_IQ_U32:
+        case I6_IQ_S32: memcpy(config + param->offset, &value, sizeof(value)); break;
+    }
+
+    if (ret = set(_i6_isp_chn, config)) {
+        HAL_WARNING("i6_iq", "Can't set %s: %#x\n", name, ret);
+        return ret;
+    }
+
+    memset(config, 0, sizeof(config));
+    if (!(ret = get(_i6_isp_chn, config))) {
+        int actual = 0;
+        switch (param->type) {
+            case I6_IQ_U8: actual = config[param->offset]; break;
+            case I6_IQ_U16: {
+                unsigned short v;
+                memcpy(&v, config + param->offset, sizeof(v));
+                actual = v;
+                break;
+            }
+            case I6_IQ_U32:
+            case I6_IQ_S32:
+                memcpy(&actual, config + param->offset, sizeof(actual));
+                break;
+        }
+        if (actual != value)
+            HAL_WARNING("i6_iq", "%s requested %d but read back %d\n",
+                name, value, actual);
+        else
+            HAL_INFO("i6_iq", "%s = %d (verified)\n", name, value);
+    } else {
+        HAL_WARNING("i6_iq", "Can't verify %s: %#x\n", name, ret);
+    }
+    return EXIT_SUCCESS;
+}
+
 int i6_pipeline_create(char index, short width, short height, char mirror, char flip, char framerate)
 {
     int ret;

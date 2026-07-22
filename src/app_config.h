@@ -41,6 +41,7 @@ struct AppConfig {
     bool mirror;
     bool flip;
     int antiflicker;
+    int ae_ev_comp;
 
     // [osd]
     bool osd_enable;
