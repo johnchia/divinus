@@ -162,7 +162,13 @@ int i6_channel_bind(char index, char framerate)
             .device = _i6_vpe_dev, .channel = _i6_vpe_chn, .port = index };
         i6_sys_bind dest = { .module = I6_SYS_MOD_VENC,
             .device = device, .channel = index, .port = _i6_venc_port };
-        if (ret = i6_sys.fnBindExt(&source, &dest, framerate, framerate,
+        /* VPE is fed at the sensor pipeline rate.  The encoder port may run
+         * slower (for example a 5 fps substream from a 20 fps sensor), so the
+         * bind must describe the real source and destination rates separately.
+         * Claiming the reduced output rate on both sides makes the scaler
+         * deliver frames unevenly even though the encoder ultimately produces
+         * the requested frame count. */
+        if (ret = i6_sys.fnBindExt(&source, &dest, _i6_snr_framerate, framerate,
             I6_SYS_LINK_FRAMEBASE, 0))
             return ret;
     }
