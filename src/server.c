@@ -206,12 +206,6 @@ void send_h26x_to_client(char index, hal_vidstream *stream) {
                     break;
 
                 client_fds[c].nalCnt++;
-                if (client_fds[c].nalCnt == 300) {
-                    char end[] = "0\r\n\r\n";
-                    send_to_client(c, end, sizeof(end) - 1);
-                    free_client(c);
-                    break;
-                }
             }
         }
         pthread_mutex_unlock(&client_fds_mutex);

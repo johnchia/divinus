@@ -21,6 +21,8 @@
 #include "stream.h"
 
 extern rtsp_handle rtspHandle;
+extern int mp4_index;
+extern int substream_index;
 
 int sdk_start(void);
 int sdk_stop(void);
@@ -43,3 +45,4 @@ int media_mjpeg_disable(void);
 int media_mjpeg_enable(void);
 int media_mp4_disable(void);
 int media_mp4_enable(void);
+int media_substream_enable(void);

@@ -85,7 +85,7 @@ static inline int __split_nal(unsigned char *buf, unsigned char **nalptr, size_t
     }
 
     *nalptr = &(buf[start]);
-    *p_len = max_len + 2 - start;
+    *p_len = max_len - start;
 
     return SUCCESS;
 }

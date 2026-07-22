@@ -162,6 +162,14 @@ int app_config_save(void) {
     fprintf(file, "  profile: %d\n", app_config.mp4_profile);
     fprintf(file, "  bitrate: %d\n", app_config.mp4_bitrate);
 
+    fprintf(file, "substream:\n");
+    fprintf(file, "  enable: %s\n", app_config.substream_enable ? "true" : "false");
+    fprintf(file, "  width: %d\n", app_config.substream_width);
+    fprintf(file, "  height: %d\n", app_config.substream_height);
+    fprintf(file, "  fps: %d\n", app_config.substream_fps);
+    fprintf(file, "  gop: %d\n", app_config.substream_gop);
+    fprintf(file, "  bitrate: %d\n", app_config.substream_bitrate);
+
     fprintf(file, "osd:\n");
     fprintf(file, "  enable: %s\n", app_config.osd_enable ? "true" : "false");
     for (char i = 0; i < MAX_OSD; i++) {
@@ -258,6 +266,12 @@ enum ConfigError app_config_parse(void) {
     app_config.audio_gain = 0;
     app_config.jpeg_enable = false;
     app_config.mp4_enable = false;
+    app_config.substream_enable = false;
+    app_config.substream_fps = 15;
+    app_config.substream_gop = 15;
+    app_config.substream_width = 1024;
+    app_config.substream_height = 576;
+    app_config.substream_bitrate = 1024;
 
     app_config.mjpeg_enable = false;
     app_config.mjpeg_fps = 15;
@@ -306,9 +320,11 @@ enum ConfigError app_config_parse(void) {
     if (err != CONFIG_OK)
         goto RET_ERR;
     app_config.web_port = (unsigned short)port;
-    parse_list(&ini, "system", "web_whitelist",
+    err = parse_list(&ini, "system", "web_whitelist",
         sizeof(app_config.web_whitelist) / sizeof(*app_config.web_whitelist),
         &count, app_config.web_whitelist);
+    if (err != CONFIG_OK && err != CONFIG_PARAM_NOT_FOUND)
+        goto RET_ERR;
     *app_config.web_whitelist[count] = '\0';
     parse_bool(&ini, "system", "web_enable_auth", &app_config.web_enable_auth);
     parse_param_value(
@@ -512,6 +528,25 @@ enum ConfigError app_config_parse(void) {
             &ini, "mp4", "bitrate", 32, INT_MAX, &app_config.mp4_bitrate);
         if (err != CONFIG_OK)
             goto RET_ERR;
+    }
+
+    parse_bool(&ini, "substream", "enable", &app_config.substream_enable);
+    if (app_config.substream_enable) {
+        err = parse_int(&ini, "substream", "width", 160, INT_MAX,
+            &app_config.substream_width);
+        if (err != CONFIG_OK) goto RET_ERR;
+        err = parse_int(&ini, "substream", "height", 120, INT_MAX,
+            &app_config.substream_height);
+        if (err != CONFIG_OK) goto RET_ERR;
+        err = parse_int(&ini, "substream", "fps", 1, INT_MAX,
+            &app_config.substream_fps);
+        if (err != CONFIG_OK) goto RET_ERR;
+        app_config.substream_gop = app_config.substream_fps;
+        parse_int(&ini, "substream", "gop", 1, INT_MAX,
+            &app_config.substream_gop);
+        err = parse_int(&ini, "substream", "bitrate", 32, INT_MAX,
+            &app_config.substream_bitrate);
+        if (err != CONFIG_OK) goto RET_ERR;
     }
 
     err = parse_bool(&ini, "jpeg", "enable", &app_config.jpeg_enable);

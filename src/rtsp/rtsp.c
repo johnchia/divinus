@@ -167,6 +167,7 @@ static void __method_options(struct connection_item_t *p, rtsp_handle h)
 static void __method_describe(struct connection_item_t *p, rtsp_handle h)
 {
     char sdp[__RTSP_TCP_BUF_SIZE];
+    struct rtsp_stream_state_t *state = &h->stream[p->stream_id];
 
     const char baseRtp[] =
         "v=0\r\n"
@@ -195,17 +196,17 @@ static void __method_describe(struct connection_item_t *p, rtsp_handle h)
             h->audioPt, h->audioPt, audioRtpfmt);
     }
 
-    if (h->isH265 &&
-        h->sprop_vps_b64 && h->sprop_sps_b64 && h->sprop_sps_b16 && h->sprop_pps_b64) {
-        DASSERT(h->sprop_vps_b64->result, return);
-        DASSERT(h->sprop_sps_b64->result, return);
-        DASSERT(h->sprop_sps_b16->result, return);
-        DASSERT(h->sprop_pps_b64->result, return);
+    if (state->isH265 &&
+        state->sprop_vps_b64 && state->sprop_sps_b64 && state->sprop_sps_b16 && state->sprop_pps_b64) {
+        DASSERT(state->sprop_vps_b64->result, return);
+        DASSERT(state->sprop_sps_b64->result, return);
+        DASSERT(state->sprop_sps_b16->result, return);
+        DASSERT(state->sprop_pps_b64->result, return);
 
-        DBG("VPS BASE64:%s\n", h->sprop_vps_b64->result);
-        DBG("SPS BASE64:%s\n", h->sprop_sps_b64->result);
-        DBG("SPS BASE16:%s\n", h->sprop_sps_b16->result);
-        DBG("PPS BASE64:%s\n", h->sprop_pps_b64->result);
+        DBG("VPS BASE64:%s\n", state->sprop_vps_b64->result);
+        DBG("SPS BASE64:%s\n", state->sprop_sps_b64->result);
+        DBG("SPS BASE16:%s\n", state->sprop_sps_b16->result);
+        DBG("PPS BASE64:%s\n", state->sprop_pps_b64->result);
 
         snprintf(sdp, __RTSP_TCP_BUF_SIZE- 1,
                 "%sm=video 0 RTP/AVP 96\r\n"
@@ -215,20 +216,20 @@ static void __method_describe(struct connection_item_t *p, rtsp_handle h)
                 " packetization-mode=1;"
                 " sprop-parameter-sets=%s,%s,%s;%s",
                 baseRtp,
-                h->sprop_sps_b16->result,
-                h->sprop_vps_b64->result,
-                h->sprop_sps_b64->result,
-                h->sprop_pps_b64->result,
+                state->sprop_sps_b16->result,
+                state->sprop_vps_b64->result,
+                state->sprop_sps_b64->result,
+                state->sprop_pps_b64->result,
                 audioRtp);
-    } else if (!h->isH265 &&
-        h->sprop_sps_b64 && h->sprop_sps_b16 && h->sprop_pps_b64) {
-        DASSERT(h->sprop_sps_b64->result, return);
-        DASSERT(h->sprop_sps_b16->result, return);
-        DASSERT(h->sprop_pps_b64->result, return);
+    } else if (!state->isH265 &&
+        state->sprop_sps_b64 && state->sprop_sps_b16 && state->sprop_pps_b64) {
+        DASSERT(state->sprop_sps_b64->result, return);
+        DASSERT(state->sprop_sps_b16->result, return);
+        DASSERT(state->sprop_pps_b64->result, return);
 
-        DBG("SPS BASE64:%s\n", h->sprop_sps_b64->result);
-        DBG("SPS BASE16:%s\n", h->sprop_sps_b16->result);
-        DBG("PPS BASE64:%s\n", h->sprop_pps_b64->result);
+        DBG("SPS BASE64:%s\n", state->sprop_sps_b64->result);
+        DBG("SPS BASE16:%s\n", state->sprop_sps_b16->result);
+        DBG("PPS BASE64:%s\n", state->sprop_pps_b64->result);
 
         snprintf(sdp, __RTSP_TCP_BUF_SIZE - 1,
                 "%sm=video 0 RTP/AVP 96\r\n"
@@ -238,9 +239,9 @@ static void __method_describe(struct connection_item_t *p, rtsp_handle h)
                 " packetization-mode=1;"
                 " sprop-parameter-sets=%s,%s;%s",
                 baseRtp,
-                h->sprop_sps_b16->result,
-                h->sprop_sps_b64->result,
-                h->sprop_pps_b64->result,
+                state->sprop_sps_b16->result,
+                state->sprop_sps_b64->result,
+                state->sprop_pps_b64->result,
                 audioRtp);
     } else {
         snprintf(sdp, __RTSP_TCP_BUF_SIZE - 1,
@@ -249,7 +250,7 @@ static void __method_describe(struct connection_item_t *p, rtsp_handle h)
                 "a=rtpmap:96 %s/90000\r\n"
                 "a=fmtp:96 packetization-mode=1;%s",
                 baseRtp,
-                h->isH265 ? "H265" : "H264",
+                state->isH265 ? "H265" : "H264",
                 audioRtp);
     }
 
@@ -381,22 +382,68 @@ static int __message_proc_sock(struct list_t *e, void *p)
     }
 
     if (FD_ISSET(con->client_fd, &(socks->rfds))) {
-        int first_char = fgetc(con->fp_tcp_read);
-        if (first_char == '$') {
-            unsigned char head[3];
-            if (fread(head, 1, 3, con->fp_tcp_read) == 3) {
-                int len = (head[1] << 8) | head[2];
-                while (len > 0) {
-                    int r = fread(buf, 1, min(len, sizeof(buf)), con->fp_tcp_read);
-                    if (r <= 0) break;
-                    len -= r;
-                }
-                DBG("discarded interleaved packet (%d bytes)\n", (head[1] << 8) | head[2]);
+        int first_char = 0;
+        char interleaved = con->interleaved_remaining || con->interleaved_header_len;
+
+        /* RTCP receiver reports share the nonblocking RTSP/TCP socket. Keep
+         * partial frame state so remaining binary bytes are never parsed as
+         * an RTSP request after a short read. */
+        if (!con->interleaved_remaining && !con->interleaved_header_len) {
+            first_char = fgetc(con->fp_tcp_read);
+            if (first_char == '$') {
+                con->interleaved_header_len = 1;
+                interleaved = 1;
+            } else if (first_char != EOF) {
+                ungetc(first_char, con->fp_tcp_read);
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                clearerr(con->fp_tcp_read);
+                return SUCCESS;
+            } else {
+                con->con_state = __CON_S_DISCONNECTED;
+                ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
+                return SUCCESS;
             }
+        }
+
+        if (con->interleaved_header_len) {
+            while (con->interleaved_header_len < sizeof(con->interleaved_header)) {
+                first_char = fgetc(con->fp_tcp_read);
+                if (first_char == EOF) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        clearerr(con->fp_tcp_read);
+                        return SUCCESS;
+                    }
+                    con->con_state = __CON_S_DISCONNECTED;
+                    ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
+                    return SUCCESS;
+                }
+                con->interleaved_header[con->interleaved_header_len++] = first_char;
+            }
+            con->interleaved_remaining =
+                (con->interleaved_header[1] << 8) | con->interleaved_header[2];
+            con->interleaved_header_len = 0;
+        }
+
+        while (con->interleaved_remaining) {
+            size_t wanted = min(con->interleaved_remaining, sizeof(buf));
+            size_t got = fread(buf, 1, wanted, con->fp_tcp_read);
+            con->interleaved_remaining -= got;
+            if (got < wanted) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    clearerr(con->fp_tcp_read);
+                    return SUCCESS;
+                }
+                con->con_state = __CON_S_DISCONNECTED;
+                ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
+                return SUCCESS;
+            }
+        }
+        if (interleaved) {
+            DBG("discarded interleaved packet\n");
             return SUCCESS;
-        } else if (first_char != EOF) {
-            ungetc(first_char, con->fp_tcp_read);
-        } else {
+        }
+
+        if (first_char == EOF) {
             con->con_state = __CON_S_DISCONNECTED;
             ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
             return SUCCESS;
@@ -411,6 +458,7 @@ static int __message_proc_sock(struct list_t *e, void *p)
         while (__read_line(con, buf)) {
             if (header < 1) {
                 con->track_id = 0;
+                con->stream_id = strstr(buf, "/sub") ? 1 : 0;
                 if (SCMP(__STR_OPTIONS, buf))            { con->method = __METHOD_OPTIONS;
                 } else if (SCMP(__STR_DESCRIBE, buf))    { con->method = __METHOD_DESCRIBE;
                 } else if (SCMP(__STR_SETUP, buf))       { con->method = __METHOD_SETUP;
@@ -848,10 +896,12 @@ void rtsp_finish(rtsp_handle h)
             bufpool_delete(h->con_pool);
             bufpool_delete(h->transfer_pool);
 
-            mime_encoded_delete(h->sprop_vps_b64);
-            mime_encoded_delete(h->sprop_sps_b64);
-            mime_encoded_delete(h->sprop_sps_b16);
-            mime_encoded_delete(h->sprop_pps_b64);
+            for (int i = 0; i < 2; i++) {
+                mime_encoded_delete(h->stream[i].sprop_vps_b64);
+                mime_encoded_delete(h->stream[i].sprop_sps_b64);
+                mime_encoded_delete(h->stream[i].sprop_sps_b16);
+                mime_encoded_delete(h->stream[i].sprop_pps_b64);
+            }
 
             threadpool_delete(h->pool);
         }

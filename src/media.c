@@ -79,6 +79,9 @@ int save_audio_stream(hal_audframe *frame) {
     return ret;
 }
 
+int mp4_index = -1;
+int substream_index = -1;
+
 int save_video_stream(char index, hal_vidstream *stream) {
     int ret;
 
@@ -88,7 +91,7 @@ int save_video_stream(char index, hal_vidstream *stream) {
         {
             char isH265 = chnState[index].payload == HAL_VIDCODEC_H265 ? 1 : 0;
 
-            if (app_config.mp4_enable) {
+            if (index == mp4_index) {
                 pthread_mutex_lock(&mp4Mtx);
                 send_mp4_to_client(index, stream, isH265);
                 if (recordOn) send_mp4_to_record(stream, isH265);
@@ -96,10 +99,11 @@ int save_video_stream(char index, hal_vidstream *stream) {
 
                 send_h26x_to_client(index, stream);
             }
-            if (app_config.rtsp_enable)
-                rtp_send_h26x(rtspHandle, stream, isH265);
+            if (app_config.rtsp_enable && (index == mp4_index || index == substream_index))
+                rtp_send_h26x(rtspHandle, stream, isH265,
+                    index == substream_index ? 1 : 0);
 
-            if (app_config.stream_enable) {
+            if (app_config.stream_enable && index == mp4_index) {
                 for (int i = 0; i < stream->count; i++) {
                     udp_stream_send_nal(stream->pack[i].data + stream->pack[i].offset,
                         stream->pack[i].length - stream->pack[i].offset,
@@ -585,6 +589,8 @@ int media_mp4_enable(void) {
     int ret;
 
     int index = take_next_free_channel(true);
+    if (index < 0) return EXIT_FAILURE;
+    mp4_index = index;
 
     if (ret = create_channel(index, app_config.mp4_width,
         app_config.mp4_height, app_config.mp4_fps, 0))
@@ -638,6 +644,40 @@ int media_mp4_enable(void) {
             index, ret, errstr(ret));
 
     return EXIT_SUCCESS;
+}
+
+int media_substream_enable(void) {
+    int ret;
+    int index = take_next_free_channel(true);
+    if (index < 0) return EXIT_FAILURE;
+    substream_index = index;
+
+    if (ret = create_channel(index, app_config.substream_width,
+        app_config.substream_height, app_config.substream_fps, 0))
+        return ret;
+
+    hal_vidconfig config = {
+        .width = app_config.substream_width,
+        .height = app_config.substream_height,
+        .codec = HAL_VIDCODEC_H264,
+        .mode = HAL_VIDMODE_CBR,
+        .profile = HAL_VIDPROFILE_MAIN,
+        .gop = app_config.substream_gop,
+        .framerate = app_config.substream_fps,
+        .bitrate = app_config.substream_bitrate,
+        .maxBitrate = app_config.substream_bitrate * 5 / 4,
+    };
+    switch (plat) {
+#if defined(__ARM_PCS_VFP)
+        case HAL_PLATFORM_I6: ret = i6_video_create(index, &config); break;
+        case HAL_PLATFORM_I6C: ret = i6c_video_create(index, &config); break;
+        case HAL_PLATFORM_M6: ret = m6_video_create(index, &config); break;
+        case HAL_PLATFORM_RK: ret = rk_video_create(index, &config); break;
+#endif
+        default: return EXIT_FAILURE;
+    }
+    if (ret) return ret;
+    return bind_channel(index, app_config.substream_fps, 0);
 }
 
 int sdk_start(void) {
@@ -801,6 +841,9 @@ int sdk_start(void) {
 
     if (app_config.mp4_enable && (ret = media_mp4_enable()))
         HAL_ERROR("media", "MP4 initialization failed with %#x!\n", ret);
+
+    if (app_config.substream_enable && (ret = media_substream_enable()))
+        HAL_ERROR("media", "Substream initialization failed with %#x!\n", ret);
 
     if (app_config.mjpeg_enable && (ret = media_mjpeg_enable()))
         HAL_ERROR("media", "MJPEG initialization failed with %#x!\n", ret);

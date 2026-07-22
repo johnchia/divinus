@@ -1,5 +1,5 @@
 system:
-  sensor_config: /etc/sensors/imx415.bin
+  sensor_config: /etc/sensors/gc4653.bin
   web_port: 80
   web_enable_auth: false
   web_auth_user: admin
@@ -81,12 +81,20 @@ mp4:
   enable: true
   codec: H264
   mode: CBR
-  width: 3840
-  height: 2160
-  fps: 20
-  gop: 40
-  bitrate: 1024
+  width: 2560
+  height: 1440
+  fps: 15
+  gop: 15
+  bitrate: 4096
   profile: 2
+
+substream:
+  enable: false
+  width: 1024
+  height: 576
+  fps: 15
+  gop: 15
+  bitrate: 1024
 
 jpeg:
   enable: false
@@ -95,9 +103,9 @@ jpeg:
   qfactor: 70
 
 mjpeg:
-  enable: true
+  enable: false
   mode: CBR
-  width: 3840
-  height: 2160
+  width: 2560
+  height: 1440
   fps: 20
   bitrate: 1024

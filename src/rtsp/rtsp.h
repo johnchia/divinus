@@ -101,7 +101,11 @@ struct connection_item_t {
     FILE *fp_tcp_write;
     int client_fd;
     int track_id;
+    int stream_id;
     int cseq;
+    unsigned int interleaved_remaining;
+    unsigned char interleaved_header[3];
+    unsigned char interleaved_header_len;
 
     transport_t trans[2];
 
@@ -114,6 +118,14 @@ struct connection_item_t {
     unsigned int ssrc;
     pthread_mutex_t write_mutex;
     struct list_t list_entry;
+};
+
+struct rtsp_stream_state_t {
+    char isH265;
+    mime_encoded_handle sprop_vps_b64;
+    mime_encoded_handle sprop_sps_b64;
+    mime_encoded_handle sprop_pps_b64;
+    mime_encoded_handle sprop_sps_b16;
 };
 
 struct transfer_item_t {
@@ -130,12 +142,8 @@ struct __rtsp_obj_t {
     bufpool_handle transfer_pool;
     unsigned short port;
     struct __time_stat_t stat;
-    char isH265;
+    struct rtsp_stream_state_t stream[2];
     unsigned char audioPt;
-    mime_encoded_handle sprop_vps_b64;
-    mime_encoded_handle sprop_sps_b64;
-    mime_encoded_handle sprop_pps_b64;
-    mime_encoded_handle sprop_sps_b16;
     unsigned ctx; /* for rand_r */
     int con_num;
     unsigned char max_con;
