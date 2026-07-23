@@ -907,26 +907,37 @@ static void *rtsp_thread_fn(void *arg) {
     event_free(h->quit_ev);
     h->quit_ev = NULL;
 
-    /* Tear down any connections still on the table -- the event loop
-     * stopped, so no encoder thread can still be mid-send once we get
-     * h->mutex here (rtp_send_* bails out via h->base == NULL below). */
+    /* rtsp_finish() is called before main.c stops the encoder/SDK threads
+     * (see main.c), so rtp_send_h26x()/rtp_send_mp3() can still be mid-send
+     * against a table entry while this teardown runs. Null out h->base
+     * first so any send that checks it from here on bails out immediately
+     * via its own `if (!h->base) return -1;` guard, and -- for a send that
+     * already passed that check -- decide should-free atomically with the
+     * refcount decrement, under h->mutex, exactly like client_unref() and
+     * client_unregister() do. Deciding should-free from a read of
+     * c->refcount taken *after* unlocking (as this loop used to) races a
+     * concurrent client_unref() and can double-free the same Client. */
+    struct event_base *base = h->base;
+    h->base = NULL;
+
     pthread_mutex_lock(&h->mutex);
     for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
         Client *c = h->clients[i];
         h->clients[i] = NULL;
+        bool should_free = false;
         if (c) {
             c->closing = true;
             c->refcount--;
+            should_free = c->refcount <= 0;
         }
         pthread_mutex_unlock(&h->mutex);
-        if (c && c->refcount <= 0)
+        if (should_free)
             client_free(c);
         pthread_mutex_lock(&h->mutex);
     }
     pthread_mutex_unlock(&h->mutex);
 
-    event_base_free(h->base);
-    h->base = NULL;
+    event_base_free(base);
 
     return NULL;
 }
