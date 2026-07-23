@@ -1,958 +1,988 @@
-#include <stdarg.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <errno.h>
-#include <fcntl.h>
+/*
+ * RTSP/RTP server for Divinus, built on Compy (gtxaspec/compy) for RTSP
+ * protocol handling and libevent-openipc for the event loop.
+ *
+ * Replaces the previous hand-rolled `rtsp/*` module (rtsp.c/rtp.c/mime.c +
+ * bufpool/list/hash/thread/rfc helpers). The public API in rtsp_server.h is
+ * unchanged so main.c and media.c require no changes.
+ *
+ * Architecture:
+ *  - rtsp_create() spins one thread running a libevent event_base. Accepted
+ *    connections become `Client` objects implementing Compy_Controller.
+ *  - Encoder threads (media.c: save_video_stream/aenc_thread) call
+ *    rtp_send_h26x()/rtp_send_mp3() directly, off the event-loop thread.
+ *    Every bufferevent is created with BEV_OPT_THREADSAFE and the event_base
+ *    is made lock-aware via evthread_use_pthreads(), so writing into a
+ *    client's transport from an encoder thread while the event-loop thread
+ *    concurrently parses that same client's incoming requests is safe.
+ *  - `h->clients[]` is a fixed-size table of live connections guarded by
+ *    `h->mutex`. Because encoder threads can be mid-send against a Client
+ *    while the event-loop thread wants to tear it down (peer disconnect,
+ *    TEARDOWN), Client uses a refcount: the table itself holds one
+ *    reference, each in-flight send holds another, and the struct is only
+ *    freed once both the table reference is dropped and the refcount hits
+ *    zero. This is a deliberately small, direct replacement for the old
+ *    module's bufpool-based deferred-free scheme.
+ *  - RTP timestamps use Compy_RtpTimestamp_SysClockUs (wall-clock derived),
+ *    not a hand-kept per-connection timestamp accumulator. This is a
+ *    simplification versus the old module's timestamp bookkeeping; the
+ *    ssc30kq-specific substream pacing fixes (119dd8de, 41db8e9e) still need
+ *    to be re-validated/re-derived against this new transport -- tracked as
+ *    a follow-up (see distributed-gathering-walrus.md step 3), not attempted
+ *    here.
+ *  - SPS/PPS/VPS extraction for sprop-parameter-sets and Basic auth are
+ *    reimplemented directly (not part of Compy's public API surface for the
+ *    former; Compy only ships Digest for the latter, and Basic is kept here
+ *    to match current production client compatibility -- Digest upgrade is
+ *    also a step-3 item).
+ */
+
 #include "rtsp_server.h"
-#include "common.h"
-#include "rtsp.h"
-#include "list.h"
-#include "hash.h"
-#include "mime.h"
-#include "thread.h"
-#include "rfc.h"
-#include "rtcp.h"
-#include "bufpool.h"
+
+#include "compy_libevent.h"
+
+#include <compy.h>
+
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
+#include <event2/event.h>
+#include <event2/listener.h>
+#include <event2/thread.h>
+#include <event2/util.h>
+
+#include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/ioctl.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
-extern void request_idr();
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-/******************************************************************************
- *              PRIVATE DEFINITIONS
- ******************************************************************************/
-#define __STR_OPTIONS  "OPTIONS"
-#define __STR_AUTH "AUTHORIZATION"
-#define __STR_CSEQ  "CSEQ"
-#define __STR_DESCRIBE  "DESCRIBE"
-#define __STR_SETUP  "SETUP"
-#define __STR_PLAY  "PLAY"
-#define __STR_TEARDOWN  "TEARDOWN"
-#define __STR_TRANSPORT  "TRANSPORT"
-#define __STR_CLIENTPORT  "client_port"
-#define __STR_INTERLEAVED "interleaved"
-#define __STR_RTP_AVP_TCP "RTP/AVP/TCP"
-#define __STR_SESSION  "SESSION"
-#define __STR_PAUSE "PAUSE"
-#define __STR_RECORDING "RECORDING"
-#define __STR_RANGE  "RANGE"
-#define __SPACE " "
-
-#define __RESPONCE_STR_OK "200 OK"
-#define __RESPONCE_STR_BADREQUEST "400 Bad Request"
-#define __RESPONCE_STR_METHODINVAL "455 Method Not Valid in This State"
-#define __RESPONCE_STR_METHODNOTALLOWED "405 Method Not Allowed"
-#define __RESPONCE_STR_MOVEDPERM "301 Moved Permanently"
-#define __RESPONCE_STR_SERVERERROR "500 Internal Server Error"
-#define __RESPONCE_STR_OPTIONUNSUPPORTED "551 Option not supported"
-
-#define __PARSE_ERROR(p) do {ERR("cannot parse '%s' in %s\n", buf, __FUNCTION__); p->parser_state = __PARSER_S_ERROR;}while(0)
+#include "../app_config.h"
+#include "../hal/macros.h"
+#include "../hal/types.h"
 
 /******************************************************************************
- *              PRIVATE DECLARATION
+ *              DEFINITIONS
  ******************************************************************************/
-static inline int __bind_rtp(struct connection_item_t *con );
-static inline int __bind_rtcp(struct connection_item_t *con );
-static inline int __bind_tcp(unsigned short port);
 
-static void __method_auth(struct connection_item_t *p, rtsp_handle h);
-static void __method_options(struct connection_item_t *p, rtsp_handle h);
-static void __method_describe(struct connection_item_t *p, rtsp_handle h);
-static void __method_setup(struct connection_item_t *p, rtsp_handle h);
-static void __method_play(struct connection_item_t *p, rtsp_handle h);
-static void __method_pause(struct connection_item_t *p, rtsp_handle h);
-static void __method_record(struct connection_item_t *p, rtsp_handle h);
-static void __method_error(struct connection_item_t *p, rtsp_handle h);
+#define RTSP_STREAM_MAIN 0
+#define RTSP_STREAM_SUB  1
+#define RTSP_STREAM_COUNT 2
 
-static void *rtspThrFxn(void *v);
+#define RTSP_TRACK_VIDEO 0
+#define RTSP_TRACK_AUDIO 1
 
-static inline int __connection_list_add(bufpool_handle con_pool, struct list_head_t *head,int fd, struct sockaddr_in addr);
-static int __connection_reset(void *v);
-static inline int __accept_proc_sock(rtsp_handle h, int server_fd, struct sock_select_t *p_socks);
-static int __message_proc_sock(struct list_t *e, void *p);
-static inline int __set_select_sock(struct list_t *p, void *param);
-static inline int __find_fd_max(struct list_head_t *head);
+#define RTSP_VIDEO_PAYLOAD_TYPE 96
+#define RTSP_VIDEO_CLOCK_RATE   90000
+#define RTSP_AUDIO_PAYLOAD_TYPE 14 /* MPA, RFC 2250 */
+#define RTSP_AUDIO_CLOCK_RATE   90000 /* MPA always uses a 90kHz clock */
 
-static inline bufpool_handle __connectionpool_create(int num);
-static int __connection_is_dead(struct list_t *l);
+#define RTSP_RTCP_INTERVAL_SEC 5
+
+#define RTSP_MAX_SDP_SIZE 2048
+
+/* RTSP_LOG_ERROR() bakes in `return EXIT_FAILURE;`, which only type-checks in
+ * functions returning int -- several call sites here return rtsp_handle or
+ * void*, so log the same way HAL_ERROR does without its forced return. */
+#define RTSP_LOG_ERROR(mod, x, ...) \
+    do { \
+        fprintf(stderr, "\033[0m[%s] \033[31m", (mod)); \
+        fprintf(stderr, (x), ##__VA_ARGS__); \
+        fprintf(stderr, "\033[0m"); \
+    } while (0)
 
 /******************************************************************************
- *              PRIVATE DATA
+ *              BASE64 (for sprop-parameter-sets)
  ******************************************************************************/
-static struct connection_item_t __connection_pool[RTSP_MAXIMUM_CONNECTIONS] = {};
 
-static struct transfer_item_t __transfer_pool[RTSP_MAXIMUM_CONNECTIONS] = {};
+static size_t rtsp_base64_encode(const uint8_t *src, size_t len, char *out, size_t out_size) {
+    static const char charmap[64] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0, o = 0;
 
-/******************************************************************************
- *              PRIVATE FUNCTIONS
- ******************************************************************************/
-static void *__bufgetter_connection(int i)
-{
-    return (void *)&(__connection_pool[i]);
+    while (i + 3 <= len) {
+        if (o + 4 >= out_size) break;
+        out[o++] = charmap[(src[i] >> 2) & 0x3F];
+        out[o++] = charmap[((src[i] & 0x03) << 4) | ((src[i + 1] & 0xF0) >> 4)];
+        out[o++] = charmap[((src[i + 1] & 0x0F) << 2) | ((src[i + 2] & 0xC0) >> 6)];
+        out[o++] = charmap[src[i + 2] & 0x3F];
+        i += 3;
+    }
+
+    if (len - i == 1 && o + 4 < out_size) {
+        out[o++] = charmap[(src[i] >> 2) & 0x3F];
+        out[o++] = charmap[(src[i] & 0x03) << 4];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (len - i == 2 && o + 4 < out_size) {
+        out[o++] = charmap[(src[i] >> 2) & 0x3F];
+        out[o++] = charmap[((src[i] & 0x03) << 4) | ((src[i + 1] & 0xF0) >> 4)];
+        out[o++] = charmap[(src[i + 1] & 0x0F) << 2];
+        out[o++] = '=';
+    }
+
+    out[o] = '\0';
+    return o;
 }
 
-static inline bufpool_handle __connectionpool_create(int num)
-{
-    bufpool_handle h = bufpool_create(num, (__bufgetter_connection), (__connection_reset), sizeof(struct connection_item_t));
+static void hex_encode(const uint8_t *src, size_t len, char *out) {
+    static const char charmap[16] = "0123456789ABCDEF";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = charmap[(src[i] & 0xF0) >> 4];
+        out[i * 2 + 1] = charmap[src[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
 
-    if (h) {
-        int i;
-        for(i = 0; i < num; i++) {
-            __connection_pool[i].pool = h;
-            __connection_pool[i].con_state = __CON_S_DISCONNECTED;
-            pthread_mutex_init(&__connection_pool[i].write_mutex, NULL);
+/******************************************************************************
+ *              PER-STREAM (MAIN/SUB) SDP STATE
+ ******************************************************************************/
+
+struct stream_state_t {
+    pthread_mutex_t lock;
+    bool isH265;
+    bool have_vps, have_sps, have_pps;
+    char vps_b64[256];
+    char sps_b64[256];
+    char pps_b64[64];
+    char profile_level_id[8];
+};
+
+/******************************************************************************
+ *              PER-CONNECTION (CLIENT) STATE
+ ******************************************************************************/
+
+typedef struct {
+    Compy_RtpTransport *rtp;
+    Compy_NalTransport *nal; /* video only; NULL for audio */
+    Compy_Rtcp *rtcp;
+    struct event *rtcp_ev;
+    uint64_t session_id;
+    bool set_up;
+    bool playing;
+} Track;
+
+typedef struct Client {
+    struct event_base *base;
+    struct bufferevent *bev;
+    void *libevent_ctx;
+
+    struct sockaddr_in addr;
+
+    int stream_id; /* RTSP_STREAM_MAIN or RTSP_STREAM_SUB, chosen from the
+                     * request URI ("/sub" => substream), like the previous
+                     * module. -1 until the first request arrives. */
+
+    pthread_mutex_t lock; /* guards the two Track slots + refcount below */
+    Track tracks[2]; /* indexed by RTSP_TRACK_VIDEO / RTSP_TRACK_AUDIO */
+
+    int refcount;   /* table reference (1) + one per in-flight sender */
+    bool closing;
+
+    rtsp_handle server;
+} Client;
+
+declImpl(Compy_Controller, Client);
+
+/******************************************************************************
+ *              RTSP SERVER HANDLE
+ ******************************************************************************/
+
+struct __rtsp_obj_t {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+
+    struct event_base *base;
+    struct evconnlistener *listener;
+    struct event *quit_ev;
+
+    unsigned short port;
+    unsigned char max_con;
+    int priority;
+
+    volatile int quit;
+    volatile int started;
+
+    Client *clients[RTSP_MAXIMUM_CONNECTIONS];
+    int con_num;
+
+    struct stream_state_t stream[RTSP_STREAM_COUNT];
+
+    char isAuthOn;
+    char user[32];
+    char pass[32];
+
+    unsigned char audioPt;
+};
+
+/******************************************************************************
+ *              CLIENT LIFETIME
+ ******************************************************************************/
+
+static void client_track_teardown(Client *c, int track) {
+    Track *t = &c->tracks[track];
+
+    if (t->rtcp_ev) {
+        event_del(t->rtcp_ev);
+        event_free(t->rtcp_ev);
+        t->rtcp_ev = NULL;
+    }
+    if (t->rtcp) {
+        int bye_ret __attribute__((unused)) = Compy_Rtcp_send_bye(t->rtcp);
+        VCALL(DYN(Compy_Rtcp, Compy_Droppable, t->rtcp), drop);
+        t->rtcp = NULL;
+    }
+    if (t->nal) {
+        VTABLE(Compy_NalTransport, Compy_Droppable).drop(t->nal);
+        t->nal = NULL;
+        t->rtp = NULL; /* owned by the NalTransport, already dropped */
+    } else if (t->rtp) {
+        VTABLE(Compy_RtpTransport, Compy_Droppable).drop(t->rtp);
+        t->rtp = NULL;
+    }
+    t->set_up = false;
+    t->playing = false;
+}
+
+/* Called with refcount already at 0 and closing == true: no other thread can
+ * still be holding a pointer to `c`. */
+static void client_free(Client *c) {
+    pthread_mutex_lock(&c->lock);
+    client_track_teardown(c, RTSP_TRACK_VIDEO);
+    client_track_teardown(c, RTSP_TRACK_AUDIO);
+    pthread_mutex_unlock(&c->lock);
+
+    pthread_mutex_destroy(&c->lock);
+
+    if (c->bev)
+        bufferevent_free(c->bev);
+    if (c->libevent_ctx)
+        compy_libevent_ctx_free(c->libevent_ctx); /* also drops the Controller */
+
+    free(c);
+}
+
+/* Drop one reference. Must be called without h->mutex held. */
+static void client_unref(rtsp_handle h, Client *c) {
+    bool should_free = false;
+
+    pthread_mutex_lock(&h->mutex);
+    c->refcount--;
+    if (c->refcount <= 0 && c->closing)
+        should_free = true;
+    pthread_mutex_unlock(&h->mutex);
+
+    if (should_free)
+        client_free(c);
+}
+
+/* Removes `c` from the live-connections table and drops the table's own
+ * reference. Safe to call from the event-loop thread only (on_event_cb,
+ * TEARDOWN). */
+static void client_unregister(rtsp_handle h, Client *c) {
+    bool should_free = false;
+
+    pthread_mutex_lock(&h->mutex);
+    for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
+        if (h->clients[i] == c) {
+            h->clients[i] = NULL;
+            h->con_num--;
+            break;
+        }
+    }
+    c->closing = true;
+    c->refcount--;
+    if (c->refcount <= 0)
+        should_free = true;
+    pthread_mutex_unlock(&h->mutex);
+
+    if (should_free)
+        client_free(c);
+}
+
+static void Client_drop(VSelf) {
+    VSELF(Client);
+    (void)self;
+    /* Actual teardown happens in client_free(), driven by the refcount; the
+     * Compy_Droppable protocol still requires an impl for the interface. */
+}
+
+impl(Compy_Droppable, Client);
+
+/******************************************************************************
+ *              AUTH (Basic, to match the previous module's behaviour)
+ ******************************************************************************/
+
+static bool client_check_auth(rtsp_handle h, Compy_Context *ctx, const Compy_Request *req) {
+    if (!h->isAuthOn)
+        return true;
+
+    CharSlice99 auth_hdr;
+    if (Compy_HeaderMap_find(&req->header_map, COMPY_HEADER_AUTHORIZATION, &auth_hdr)) {
+        char hdr_buf[256];
+        size_t n = auth_hdr.len < sizeof hdr_buf - 1 ? auth_hdr.len : sizeof hdr_buf - 1;
+        memcpy(hdr_buf, auth_hdr.ptr, n);
+        hdr_buf[n] = '\0';
+
+        if (strncmp(hdr_buf, "Basic ", 6) == 0) {
+            char expected[96];
+            char creds[128];
+            snprintf(creds, sizeof creds, "%s:%s", h->user, h->pass);
+
+            /* Encode expected creds and compare against the base64 the
+             * client sent, avoiding a base64-decode implementation. */
+            rtsp_base64_encode((const uint8_t *)creds, strlen(creds), expected, sizeof expected);
+
+            if (strcmp(hdr_buf + 6, expected) == 0)
+                return true;
         }
     }
 
-    return h;
-}
-
-static void *__bufgetter_trans(int i)
-{
-    return (void *)&(__transfer_pool[i]);
-}
-
-static inline bufpool_handle __transpool_create(int num)
-{
-    bufpool_handle h = bufpool_create(num, (__bufgetter_trans), NULL, sizeof(struct transfer_item_t));
-
-    if (h) {
-        int i;
-        for(i = 0; i < num; i++) {
-            __transfer_pool[i].pool = h;
-            __transfer_pool[i].list_entry.cleaner = (__transfer_item_cleaner);
-        }
-    }
-
-    return h;
+    compy_header(ctx, COMPY_HEADER_WWW_AUTHENTICATE, "Basic realm=\"Access the camera streams\"");
+    compy_respond(ctx, COMPY_STATUS_UNAUTHORIZED, "Unauthorized");
+    return false;
 }
 
 /******************************************************************************
- *              RESPONSE IMPLEMENTATIONS
+ *              SPS/PPS/VPS EXTRACTION (per stream_id)
  ******************************************************************************/
-static int __rtsp_write(struct connection_item_t *p, const char *fmt, ...)
-{
-    va_list args;
-    int ret;
 
-    pthread_mutex_lock(&p->write_mutex);
-    va_start(args, fmt);
-    ret = vfprintf(p->fp_tcp_write, fmt, args);
-    va_end(args);
-    fflush(p->fp_tcp_write);
-    pthread_mutex_unlock(&p->write_mutex);
+static void stream_state_ingest(struct stream_state_t *state, bool isH265, const uint8_t *data, size_t len) {
+    U8Slice99 slice = U8Slice99_new((uint8_t *)data, len);
+    Compy_NalStartCodeTester tester = compy_determine_start_code(slice);
+    if (!tester)
+        return;
 
-    return ret;
+    pthread_mutex_lock(&state->lock);
+    state->isH265 = isH265;
+    pthread_mutex_unlock(&state->lock);
+
+    while (!U8Slice99_is_empty(slice)) {
+        size_t sc = tester(slice);
+        if (!sc) {
+            slice = U8Slice99_advance(slice, 1);
+            continue;
+        }
+        slice = U8Slice99_advance(slice, sc);
+
+        /* Find the end of this NAL (start of the next start code, or EOF). */
+        U8Slice99 rest = slice;
+        size_t nal_len = 0;
+        while (!U8Slice99_is_empty(rest)) {
+            size_t inner_sc = tester(rest);
+            if (inner_sc)
+                break;
+            rest = U8Slice99_advance(rest, 1);
+            nal_len++;
+        }
+        if (nal_len < 2) {
+            slice = rest;
+            continue;
+        }
+
+        uint8_t unit_type = isH265 ? ((slice.ptr[0] >> 1) & 0x3F) : (slice.ptr[0] & 0x1F);
+        bool is_vps = isH265 && unit_type == COMPY_H265_NAL_UNIT_VPS_NUT;
+        bool is_sps = isH265 ? unit_type == COMPY_H265_NAL_UNIT_SPS_NUT
+                              : unit_type == COMPY_H264_NAL_UNIT_SPS;
+        bool is_pps = isH265 ? unit_type == COMPY_H265_NAL_UNIT_PPS_NUT
+                              : unit_type == COMPY_H264_NAL_UNIT_PPS;
+
+        pthread_mutex_lock(&state->lock);
+        if (is_vps && !state->have_vps) {
+            rtsp_base64_encode(slice.ptr, nal_len, state->vps_b64, sizeof state->vps_b64);
+            state->have_vps = true;
+        } else if (is_sps && !state->have_sps) {
+            rtsp_base64_encode(slice.ptr, nal_len, state->sps_b64, sizeof state->sps_b64);
+            /* profile-level-id: 3 bytes following the NAL header(s). */
+            size_t header_size = isH265 ? 2 : 1;
+            if (nal_len >= header_size + 3)
+                hex_encode(slice.ptr + header_size, 3, state->profile_level_id);
+            state->have_sps = true;
+        } else if (is_pps && !state->have_pps) {
+            rtsp_base64_encode(slice.ptr, nal_len, state->pps_b64, sizeof state->pps_b64);
+            state->have_pps = true;
+        }
+        pthread_mutex_unlock(&state->lock);
+
+        slice = rest;
+    }
 }
 
-static void __method_auth(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p, "RTSP/1.0 401 Unauthorized\r\n"
-            "CSeq: %d\r\n"
-            "WWW-Authenticate: Basic realm=\"Access the camera streams\"\r\n"
-            "\r\n", p->cseq);
+/******************************************************************************
+ *              CONTROLLER: OPTIONS / DESCRIBE
+ ******************************************************************************/
+
+static void Client_options(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+    (void)self;
+    (void)req;
+    compy_header(ctx, COMPY_HEADER_PUBLIC, "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER");
+    compy_respond_ok(ctx);
 }
 
-static void __method_options(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p, "RTSP/1.0 200 OK\r\n"
-            "CSeq: %d\r\n"
-            "Public: OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE\r\n"
-            "\r\n", p->cseq);
-}
+static void Client_describe(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+    (void)req;
 
-static void __method_describe(struct connection_item_t *p, rtsp_handle h)
-{
-    char sdp[__RTSP_TCP_BUF_SIZE];
-    struct rtsp_stream_state_t *state = &h->stream[p->stream_id];
+    rtsp_handle h = self->server;
+    struct stream_state_t *state = &h->stream[self->stream_id];
 
-    const char baseRtp[] =
-        "v=0\r\n"
-        "o=- 0 0 IN IP4 127.0.0.1\r\n"
-        "s=librtsp\r\n"
-        "c=IN IP4 0.0.0.0\r\n"
-        "t=0 0\r\n"
-        "a=range:npt=0-\r\n";
-    char audioRtp[256] = "\r\n";
-    char audioRtpfmt[16];
+    char sdp_buf[RTSP_MAX_SDP_SIZE] = {0};
+    Compy_Writer sdp = compy_string_writer(sdp_buf);
+    ssize_t ret = 0;
+
+    const char *ip_any = "0.0.0.0";
+
+    // clang-format off
+    COMPY_SDP_DESCRIBE(
+        ret, sdp,
+        (COMPY_SDP_VERSION, "0"),
+        (COMPY_SDP_ORIGIN, "- 0 0 IN IP4 %s", ip_any),
+        (COMPY_SDP_SESSION_NAME, "Divinus"),
+        (COMPY_SDP_CONNECTION, "IN IP4 %s", ip_any),
+        (COMPY_SDP_TIME, "0 0"),
+        (COMPY_SDP_ATTR, "range:npt=0-"));
+    // clang-format on
+
+    pthread_mutex_lock(&state->lock);
+    bool isH265 = state->isH265;
+    bool have_video_sprop = state->have_sps && state->have_pps && (!isH265 || state->have_vps);
+    char sps_b64[256], pps_b64[64], vps_b64[256], profile_level_id[8];
+    strncpy(sps_b64, state->sps_b64, sizeof sps_b64);
+    strncpy(pps_b64, state->pps_b64, sizeof pps_b64);
+    strncpy(vps_b64, state->vps_b64, sizeof vps_b64);
+    strncpy(profile_level_id, state->profile_level_id, sizeof profile_level_id);
+    pthread_mutex_unlock(&state->lock);
+
+    // clang-format off
+    COMPY_SDP_DESCRIBE(
+        ret, sdp,
+        (COMPY_SDP_MEDIA, "video 0 RTP/AVP %d", RTSP_VIDEO_PAYLOAD_TYPE),
+        (COMPY_SDP_ATTR, "control:track=0"),
+        (COMPY_SDP_ATTR, "rtpmap:%d %s/%d", RTSP_VIDEO_PAYLOAD_TYPE, isH265 ? "H265" : "H264", RTSP_VIDEO_CLOCK_RATE));
+    // clang-format on
+
+    if (have_video_sprop) {
+        if (isH265)
+            ret += compy_sdp_printf(sdp, COMPY_SDP_ATTR,
+                "fmtp:%d sprop-vps=%s;sprop-sps=%s;sprop-pps=%s",
+                RTSP_VIDEO_PAYLOAD_TYPE, vps_b64, sps_b64, pps_b64);
+        else
+            ret += compy_sdp_printf(sdp, COMPY_SDP_ATTR,
+                "fmtp:%d packetization-mode=1;profile-level-id=%s;sprop-parameter-sets=%s,%s",
+                RTSP_VIDEO_PAYLOAD_TYPE, profile_level_id, sps_b64, pps_b64);
+    } else {
+        ret += compy_sdp_printf(sdp, COMPY_SDP_ATTR, "fmtp:%d packetization-mode=1", RTSP_VIDEO_PAYLOAD_TYPE);
+    }
 
     if (h->audioPt != 255) {
-        switch (h->audioPt) {
-            case 0: strncpy(audioRtpfmt, "PCMU", 16 - 1); break;
-            case 8: strncpy(audioRtpfmt, "PCMA", 16 - 1); break;
-            case 14: strncpy(audioRtpfmt, "MPA", 16 - 1); break;
-            case 18: strncpy(audioRtpfmt, "G729", 16 - 1); break;
-            case 96: strncpy(audioRtpfmt, "MPEG4-GENERIC", 16 - 1); break;
-            default: strncpy(audioRtpfmt, "UNKNOWN", 16 - 1); break;
-        }
-        sprintf(audioRtp,
-            "\r\n"
-            "m=audio 0 RTP/AVP %d\r\n"
-            "a=control:track=1\r\n"
-            "a=rtpmap:%d %s/90000\r\n",
-            h->audioPt, h->audioPt, audioRtpfmt);
+        // clang-format off
+        COMPY_SDP_DESCRIBE(
+            ret, sdp,
+            (COMPY_SDP_MEDIA, "audio 0 RTP/AVP %d", RTSP_AUDIO_PAYLOAD_TYPE),
+            (COMPY_SDP_ATTR, "control:track=1"),
+            (COMPY_SDP_ATTR, "rtpmap:%d MPA/%d", RTSP_AUDIO_PAYLOAD_TYPE, RTSP_AUDIO_CLOCK_RATE));
+        // clang-format on
     }
 
-    if (state->isH265 &&
-        state->sprop_vps_b64 && state->sprop_sps_b64 && state->sprop_sps_b16 && state->sprop_pps_b64) {
-        DASSERT(state->sprop_vps_b64->result, return);
-        DASSERT(state->sprop_sps_b64->result, return);
-        DASSERT(state->sprop_sps_b16->result, return);
-        DASSERT(state->sprop_pps_b64->result, return);
-
-        DBG("VPS BASE64:%s\n", state->sprop_vps_b64->result);
-        DBG("SPS BASE64:%s\n", state->sprop_sps_b64->result);
-        DBG("SPS BASE16:%s\n", state->sprop_sps_b16->result);
-        DBG("PPS BASE64:%s\n", state->sprop_pps_b64->result);
-
-        snprintf(sdp, __RTSP_TCP_BUF_SIZE- 1,
-                "%sm=video 0 RTP/AVP 96\r\n"
-                "a=control:track=0\r\n"
-                "a=rtpmap:96 H265/90000\r\n"
-                "a=fmtp:96 profile-level-id=%s;"
-                " packetization-mode=1;"
-                " sprop-parameter-sets=%s,%s,%s;%s",
-                baseRtp,
-                state->sprop_sps_b16->result,
-                state->sprop_vps_b64->result,
-                state->sprop_sps_b64->result,
-                state->sprop_pps_b64->result,
-                audioRtp);
-    } else if (!state->isH265 &&
-        state->sprop_sps_b64 && state->sprop_sps_b16 && state->sprop_pps_b64) {
-        DASSERT(state->sprop_sps_b64->result, return);
-        DASSERT(state->sprop_sps_b16->result, return);
-        DASSERT(state->sprop_pps_b64->result, return);
-
-        DBG("SPS BASE64:%s\n", state->sprop_sps_b64->result);
-        DBG("SPS BASE16:%s\n", state->sprop_sps_b16->result);
-        DBG("PPS BASE64:%s\n", state->sprop_pps_b64->result);
-
-        snprintf(sdp, __RTSP_TCP_BUF_SIZE - 1,
-                "%sm=video 0 RTP/AVP 96\r\n"
-                "a=control:track=0\r\n"
-                "a=rtpmap:96 H264/90000\r\n"
-                "a=fmtp:96 profile-level-id=%s;"
-                " packetization-mode=1;"
-                " sprop-parameter-sets=%s,%s;%s",
-                baseRtp,
-                state->sprop_sps_b16->result,
-                state->sprop_sps_b64->result,
-                state->sprop_pps_b64->result,
-                audioRtp);
-    } else {
-        snprintf(sdp, __RTSP_TCP_BUF_SIZE - 1,
-                "%sm=video 0 RTP/AVP 96\r\n"
-                "a=control:track=0\r\n"
-                "a=rtpmap:96 %s/90000\r\n"
-                "a=fmtp:96 packetization-mode=1;%s",
-                baseRtp,
-                state->isH265 ? "H265" : "H264",
-                audioRtp);
+    if (ret <= 0) {
+        compy_respond_internal_error(ctx);
+        return;
     }
 
-    __rtsp_write(p, "RTSP/1.0 200 OK\r\n"
-            "CSeq: %d\r\n"
-            "Content-Type: application/sdp\r\n"
-            "Content-Length: %d\r\n"
-            "\r\n"
-            "%s", p->cseq, strlen(sdp), sdp);
+    compy_header(ctx, COMPY_HEADER_CONTENT_TYPE, "application/sdp");
+    compy_body(ctx, CharSlice99_from_str(sdp_buf));
+    compy_respond_ok(ctx);
 }
-
-static void __method_setup(struct connection_item_t *p, rtsp_handle h)
-{
-    /* make randomized session id */
-	if (!p->session_id) {
-    	p->session_id = __get_random_llu(&h->ctx);
-    	p->ssrc = (unsigned int)(__get_random_llu(&h->ctx));
-	}
-
-    DBG("created session id %llx\n", p->session_id);
-
-    if (p->trans[p->track_id].is_tcp) {
-        __rtsp_write(p, "RTSP/1.0 200 OK\r\n"
-            "CSeq: %d\r\n"
-            "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n"
-            "Session: %llx\r\n"
-            "\r\n", p->cseq,
-            p->trans[p->track_id].channel_rtp,
-            p->trans[p->track_id].channel_rtcp,
-            p->session_id);
-    } else {
-        p->trans[p->track_id].server_port_rtp = SERVER_RTP_PORT + p->track_id;
-        p->trans[p->track_id].server_port_rtcp = SERVER_RTCP_PORT + p->track_id;
-
-        __rtsp_write(p, "RTSP/1.0 200 OK\r\n"
-            "CSeq: %d\r\n"
-            "Transport: RTP/AVP/UDP;unicast;client_port=%u-%u;server_port=%u-%u\r\n"
-            "Session: %llx\r\n"
-            "\r\n", p->cseq,
-            p->trans[p->track_id].client_port_rtp,
-            p->trans[p->track_id].client_port_rtcp,
-            p->trans[p->track_id].server_port_rtp,
-            p->trans[p->track_id].server_port_rtcp,
-            p->session_id);
-    }
-
-    p->con_state = __CON_S_READY;
-}
-
-static void __method_pause(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p,
-        "RTSP/1.0 "__RESPONCE_STR_METHODNOTALLOWED "\r\n");
-}
-
-static void __method_record(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p,
-        "RTSP/1.0 " __RESPONCE_STR_METHODNOTALLOWED "\r\n");
-}
-
-static void __method_error(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p,
-        "RTSP/1.0 " __RESPONCE_STR_SERVERERROR "\r\n");
-}
-
-static void __method_play(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p,
-        "RTSP/1.0 200 OK\r\n"
-        "CSeq: %d\r\n"
-        "Range: npt=now-\r\n"
-        "\r\n" , p->cseq);
-
-    for (int i = 0; i < sizeof(p->trans) / sizeof(*p->trans); i++) {
-        if (!p->trans[i].server_port_rtp) continue;
-        p->track_id = i;
-
-        ASSERT(__bind_rtcp(p) == SUCCESS, return);
-        ASSERT(__bind_rtp(p) == SUCCESS, return);
-        p->trans[p->track_id].rtp_timestamp = (millis() * 90) & UINT32_MAX;
-        p->trans[p->track_id].rtp_seq = rand_r(&h->ctx);
-        p->trans[p->track_id].rtcp_octet = 0;
-        p->trans[p->track_id].rtcp_packet_cnt = 0;
-        p->trans[p->track_id].rtcp_tick_org = 150; // TODO: must be variant
-        p->trans[p->track_id].rtcp_tick = p->trans[p->track_id].rtcp_tick_org;
-
-        ASSERT(__rtcp_send_sr(p, p->track_id) == SUCCESS, return);
-    }
-
-    p->con_state = __CON_S_PLAYING;
-
-    request_idr();
-}
-
-static int __method_teardown(struct connection_item_t *p, rtsp_handle h)
-{
-    __rtsp_write(p,
-        "RTSP/1.0 200 OK\r\n"
-        "CSeq: %d\r\n"
-        "\r\n", p->cseq);
-
-    p->con_state = __CON_S_INIT;
-
-    return SUCCESS;
-}
-
 
 /******************************************************************************
- *              METHOD IMPLEMENTATIONS
+ *              CONTROLLER: SETUP
  ******************************************************************************/
 
-static int __message_proc_sock(struct list_t *e, void *p)
-{
-    struct connection_item_t *con;
-    struct sock_select_t *socks = p;
-    char buf[__RTSP_TCP_BUF_SIZE];
-    rtsp_handle h = NULL;
+static int setup_tcp_transport(Compy_Context *ctx, const Compy_Request *req, Compy_Transport *t, Compy_Transport *rtcp_t, Compy_TransportConfig config) {
+    (void)req;
+    ifLet(config.interleaved, Compy_ChannelPair_Some, interleaved) {
+        *t = compy_transport_tcp(Compy_Context_get_writer(ctx), interleaved->rtp_channel, 0);
+        *rtcp_t = compy_transport_tcp(Compy_Context_get_writer(ctx), interleaved->rtcp_channel, 0);
 
-    DASSERT(socks, return FAILURE);
-    MUST(h = socks->h_rtsp, return FAILURE);
-
-    list_upcast(con, e);
-
-    if (con->con_state == __CON_S_DISCONNECTED) {
-        ERR("zombie connection detected: report to author\n");
-        return SUCCESS;
+        compy_header(ctx, COMPY_HEADER_TRANSPORT,
+            "RTP/AVP/TCP;unicast;interleaved=%" PRIu8 "-%" PRIu8,
+            interleaved->rtp_channel, interleaved->rtcp_channel);
+        return 0;
     }
 
-    if (FD_ISSET(con->client_fd, &(socks->rfds))) {
-        int first_char = 0;
-        char interleaved = con->interleaved_remaining || con->interleaved_header_len;
+    compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "`interleaved' not found");
+    return -1;
+}
 
-        /* RTCP receiver reports share the nonblocking RTSP/TCP socket. Keep
-         * partial frame state so remaining binary bytes are never parsed as
-         * an RTSP request after a short read. */
-        if (!con->interleaved_remaining && !con->interleaved_header_len) {
-            first_char = fgetc(con->fp_tcp_read);
-            if (first_char == '$') {
-                con->interleaved_header_len = 1;
-                interleaved = 1;
-            } else if (first_char != EOF) {
-                ungetc(first_char, con->fp_tcp_read);
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                clearerr(con->fp_tcp_read);
-                return SUCCESS;
-            } else {
-                con->con_state = __CON_S_DISCONNECTED;
-                ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
-                return SUCCESS;
-            }
+static int setup_udp_transport(Client *self, Compy_Context *ctx, Compy_Transport *t, Compy_Transport *rtcp_t, Compy_TransportConfig config) {
+    ifLet(config.client_port, Compy_PortPair_Some, client_port) {
+        int fd = compy_dgram_socket(AF_INET, &self->addr.sin_addr, client_port->rtp_port);
+        if (fd == -1) {
+            compy_respond_internal_error(ctx);
+            return -1;
+        }
+        int rtcp_fd = compy_dgram_socket(AF_INET, &self->addr.sin_addr, client_port->rtcp_port);
+        if (rtcp_fd == -1) {
+            close(fd);
+            compy_respond_internal_error(ctx);
+            return -1;
         }
 
-        if (con->interleaved_header_len) {
-            while (con->interleaved_header_len < sizeof(con->interleaved_header)) {
-                first_char = fgetc(con->fp_tcp_read);
-                if (first_char == EOF) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        clearerr(con->fp_tcp_read);
-                        return SUCCESS;
-                    }
-                    con->con_state = __CON_S_DISCONNECTED;
-                    ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
-                    return SUCCESS;
-                }
-                con->interleaved_header[con->interleaved_header_len++] = first_char;
-            }
-            con->interleaved_remaining =
-                (con->interleaved_header[1] << 8) | con->interleaved_header[2];
-            con->interleaved_header_len = 0;
+        uint16_t server_rtp_port = 0, server_rtcp_port = 0;
+        struct sockaddr_in local = {0};
+        socklen_t local_len = sizeof local;
+        if (getsockname(fd, (struct sockaddr *)&local, &local_len) == 0)
+            server_rtp_port = ntohs(local.sin_port);
+        local_len = sizeof local;
+        if (getsockname(rtcp_fd, (struct sockaddr *)&local, &local_len) == 0)
+            server_rtcp_port = ntohs(local.sin_port);
+
+        *t = compy_transport_udp(fd);
+        *rtcp_t = compy_transport_udp(rtcp_fd);
+
+        compy_header(ctx, COMPY_HEADER_TRANSPORT,
+            "RTP/AVP/UDP;unicast;client_port=%" PRIu16 "-%" PRIu16 ";server_port=%" PRIu16 "-%" PRIu16,
+            client_port->rtp_port, client_port->rtcp_port, server_rtp_port, server_rtcp_port);
+        return 0;
+    }
+
+    compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "`client_port' not found");
+    return -1;
+}
+
+static void Client_setup(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+
+    CharSlice99 transport_val;
+    if (!Compy_HeaderMap_find(&req->header_map, COMPY_HEADER_TRANSPORT, &transport_val)) {
+        compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "`Transport' not present");
+        return;
+    }
+
+    Compy_TransportConfig config;
+    if (compy_parse_transport(&config, transport_val) == -1) {
+        compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "Malformed `Transport'");
+        return;
+    }
+
+    /* URI ends in ".../track=1" for the audio track, ".../track=0" (or the
+     * base URL, for aggregate control) otherwise -- matches the SDP
+     * a=control lines advertised in DESCRIBE above. */
+    char uri_buf[256];
+    size_t uri_n = req->start_line.uri.len < sizeof uri_buf - 1 ? req->start_line.uri.len : sizeof uri_buf - 1;
+    memcpy(uri_buf, req->start_line.uri.ptr, uri_n);
+    uri_buf[uri_n] = '\0';
+    int track = strstr(uri_buf, "track=1") ? RTSP_TRACK_AUDIO : RTSP_TRACK_VIDEO;
+
+    Compy_Transport transport, rtcp_transport;
+    int rc;
+    switch (config.lower) {
+    case Compy_LowerTransport_TCP:
+        rc = setup_tcp_transport(ctx, req, &transport, &rtcp_transport, config);
+        break;
+    case Compy_LowerTransport_UDP:
+        rc = setup_udp_transport(self, ctx, &transport, &rtcp_transport, config);
+        break;
+    default:
+        rc = -1;
+        break;
+    }
+    if (rc == -1)
+        return;
+
+    uint64_t session_id;
+    bool has_session = Compy_HeaderMap_contains_key(&req->header_map, COMPY_HEADER_SESSION);
+    if (has_session) {
+        if (compy_scanf_header(&req->header_map, COMPY_HEADER_SESSION, "%" SCNu64, &session_id) != 1) {
+            VCALL_SUPER(rtcp_transport, Compy_Droppable, drop);
+            VCALL_SUPER(transport, Compy_Droppable, drop);
+            compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "Malformed `Session'");
+            return;
         }
-
-        while (con->interleaved_remaining) {
-            size_t wanted = min(con->interleaved_remaining, sizeof(buf));
-            size_t got = fread(buf, 1, wanted, con->fp_tcp_read);
-            con->interleaved_remaining -= got;
-            if (got < wanted) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    clearerr(con->fp_tcp_read);
-                    return SUCCESS;
-                }
-                con->con_state = __CON_S_DISCONNECTED;
-                ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
-                return SUCCESS;
-            }
-        }
-        if (interleaved) {
-            DBG("discarded interleaved packet\n");
-            return SUCCESS;
-        }
-
-        if (first_char == EOF) {
-            con->con_state = __CON_S_DISCONNECTED;
-            ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
-            return SUCCESS;
-        }
-
-        con->parser_state = __PARSER_S_INIT;
-        con->method = __METHOD_NONE;
-
-        char header = 0, isAuthValid = 0, *tok, *last;
-        unsigned long long session_id;
-        /* parse line by line. hereafter parser is switched according to the finite state machine */
-        while (__read_line(con, buf)) {
-            if (header < 1) {
-                con->track_id = 0;
-                con->stream_id = strstr(buf, "/sub") ? 1 : 0;
-                if (SCMP(__STR_OPTIONS, buf))            { con->method = __METHOD_OPTIONS;
-                } else if (SCMP(__STR_DESCRIBE, buf))    { con->method = __METHOD_DESCRIBE;
-                } else if (SCMP(__STR_SETUP, buf))       { con->method = __METHOD_SETUP;
-                    STR_KEY_NUM(buf, "track=", con->track_id);
-                } else if (SCMP(__STR_PLAY, buf))        { con->method = __METHOD_PLAY;
-                } else if (SCMP(__STR_RECORDING, buf))   { con->method = __METHOD_RECORDING;
-                } else if (SCMP(__STR_PAUSE, buf))       { con->method = __METHOD_PAUSE;
-                } else if (SCMP(__STR_TEARDOWN, buf))    { con->method = __METHOD_TEARDOWN;
-                } header++;
-            }
-
-            if (SCMP(__STR_AUTH, buf) && h->isAuthOn) {
-                    char cred[66], valid[256];
-                    sprintf(cred, "%s:%s", h->user, h->pass);
-                    strcpy(valid, "Basic ");
-                    base64_encode(valid + 6, cred, strlen(cred));
-                    isAuthValid = !strncmp(buf + strlen(__STR_AUTH) + 2, valid, strlen(valid));
-             } else if (SCMP(__STR_CSEQ, buf)) {
-                ASSERT(tok = strtok_r(buf, ": ", &last), goto error);
-                ASSERT(tok = strtok_r(NULL, ": ", &last), goto error);
-                ASSERT((con->cseq = atoi(tok)) > 0, goto error);
-                con->parser_state = __PARSER_S_CSEQ;
-            } else if (SCMP(__STR_RANGE, buf)) {
-                con->parser_state = __PARSER_S_RANGE;
-            } else if (SCMP(__STR_SESSION, buf)) {
-                ASSERT(tok = strtok_r(buf, ": ", &last), goto error);
-                ASSERT(tok = strtok_r(NULL, ": ", &last), goto error);
-                ASSERT(sscanf(tok, "%llx", &session_id) > 0, goto error);
-                con->given_session_id = session_id;
-                con->parser_state = __PARSER_S_SESSION;
-            } else if (SCMP(__STR_TRANSPORT, buf)) {
-                if (strstr(buf, __STR_RTP_AVP_TCP)) {
-                    con->trans[con->track_id].is_tcp = 1;
-                }
-                for (tok = strtok_r(buf, "; ", &last); tok != NULL; tok = strtok_r(NULL, "; ", &last)) {
-                    if (SCMP(__STR_CLIENTPORT, tok)) {
-                        ASSERT(sscanf(tok, __STR_CLIENTPORT "=%u-%u",
-                            &con->trans[con->track_id].client_port_rtp,
-                            &con->trans[con->track_id].client_port_rtcp) > 0,
-                                goto error);
-
-                        con->parser_state = __PARSER_S_TRANSPORT;
-                    } else if (SCMP(__STR_INTERLEAVED, tok)) {
-                        ASSERT(sscanf(tok, __STR_INTERLEAVED "=%hhu-%hhu",
-                            &con->trans[con->track_id].channel_rtp,
-                            &con->trans[con->track_id].channel_rtcp) > 0,
-                                goto error);
-
-                        con->parser_state = __PARSER_S_TRANSPORT;
-                    }
-                }
-            }
-            continue;
-error:
-            __PARSE_ERROR(con);
-        }
-
-        if (con->parser_state == __PARSER_S_ERROR) {
-            __method_error(con, h);
+    } else {
+        FILE *f = fopen("/dev/urandom", "r");
+        if (f) {
+            if (fread(&session_id, sizeof session_id, 1, f) != 1)
+                session_id = (uint64_t)random() << 32 | (uint64_t)random();
+            fclose(f);
         } else {
-            if (con->method != __METHOD_NONE && h->isAuthOn && !isAuthValid)
-                con->method = __METHOD_AUTH;
-            switch (con->method) {
-                case __METHOD_AUTH: __method_auth(con, h); break;
-                case __METHOD_OPTIONS: __method_options(con, h); break;
-                case __METHOD_DESCRIBE: __method_describe(con, h); break;
-                case __METHOD_SETUP: __method_setup(con, h); break;
-                case __METHOD_PLAY: __method_play(con, h); break;
-                case __METHOD_PAUSE: __method_pause(con, h); break;
-                case __METHOD_RECORDING: __method_record(con, h); break;
-                case __METHOD_TEARDOWN: __method_teardown(con, h); break;
-                case __METHOD_NONE:
-                    /* state DISCONNECTED connections should be garbage collected immediately.
-                       but sending thread might watches the connection right now.
-                       so the connection might live at here */
-                    if (con->con_state != __CON_S_DISCONNECTED) {
-                        ERR("unexpected empty request, forcing disconnect\n");
-                        con->con_state = __CON_S_DISCONNECTED;
-                    }
-                    ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
-                    break;
-                default: ERR("unexpected method state\n"); return FAILURE;
+            session_id = (uint64_t)random() << 32 | (uint64_t)random();
+        }
+    }
+
+    pthread_mutex_lock(&self->lock);
+    Track *t = &self->tracks[track];
+    if (t->set_up)
+        client_track_teardown(self, track);
+
+    if (track == RTSP_TRACK_VIDEO) {
+        t->rtp = Compy_RtpTransport_new(transport, RTSP_VIDEO_PAYLOAD_TYPE, RTSP_VIDEO_CLOCK_RATE);
+        t->nal = Compy_NalTransport_new(t->rtp);
+    } else {
+        t->rtp = Compy_RtpTransport_new(transport, RTSP_AUDIO_PAYLOAD_TYPE, RTSP_AUDIO_CLOCK_RATE);
+        t->nal = NULL;
+    }
+    t->rtcp = Compy_Rtcp_new(t->rtp, rtcp_transport, "divinus@camera");
+    t->session_id = session_id;
+    t->set_up = true;
+    t->playing = false;
+    pthread_mutex_unlock(&self->lock);
+
+    compy_header(ctx, COMPY_HEADER_SESSION, "%" PRIu64, session_id);
+    compy_respond_ok(ctx);
+}
+
+/******************************************************************************
+ *              CONTROLLER: PLAY / PAUSE / TEARDOWN / GET_PARAMETER
+ ******************************************************************************/
+
+static void send_rtcp_sr_cb(evutil_socket_t fd, short events, void *arg) {
+    (void)fd;
+    (void)events;
+    int sr_ret __attribute__((unused)) = Compy_Rtcp_send_sr((Compy_Rtcp *)arg);
+}
+
+static void Client_play(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+
+    uint64_t session_id;
+    if (compy_scanf_header(&req->header_map, COMPY_HEADER_SESSION, "%" SCNu64, &session_id) != 1) {
+        compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "Malformed `Session'");
+        return;
+    }
+
+    bool played = false;
+    pthread_mutex_lock(&self->lock);
+    for (int i = 0; i < 2; i++) {
+        Track *t = &self->tracks[i];
+        if (t->set_up && t->session_id == session_id) {
+            t->playing = true;
+            if (t->rtcp && !t->rtcp_ev) {
+                t->rtcp_ev = event_new(self->base, -1, EV_PERSIST | EV_TIMEOUT, send_rtcp_sr_cb, t->rtcp);
+                if (t->rtcp_ev)
+                    event_add(t->rtcp_ev, &(const struct timeval){.tv_sec = RTSP_RTCP_INTERVAL_SEC});
             }
+            played = true;
         }
     }
-    return SUCCESS;
+    pthread_mutex_unlock(&self->lock);
+
+    if (!played) {
+        compy_respond(ctx, COMPY_STATUS_SESSION_NOT_FOUND, "Invalid Session ID");
+        return;
+    }
+
+    compy_header(ctx, COMPY_HEADER_RANGE, "npt=now-");
+    compy_respond_ok(ctx);
 }
 
+static void Client_pause_method(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+
+    uint64_t session_id;
+    if (compy_scanf_header(&req->header_map, COMPY_HEADER_SESSION, "%" SCNu64, &session_id) != 1) {
+        compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "Malformed `Session'");
+        return;
+    }
+
+    pthread_mutex_lock(&self->lock);
+    for (int i = 0; i < 2; i++) {
+        Track *t = &self->tracks[i];
+        if (t->set_up && t->session_id == session_id)
+            t->playing = false;
+    }
+    pthread_mutex_unlock(&self->lock);
+
+    compy_respond_ok(ctx);
+}
+
+static void Client_teardown(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+
+    uint64_t session_id;
+    if (compy_scanf_header(&req->header_map, COMPY_HEADER_SESSION, "%" SCNu64, &session_id) != 1) {
+        compy_respond(ctx, COMPY_STATUS_BAD_REQUEST, "Malformed `Session'");
+        return;
+    }
+
+    bool torn_down = false;
+    pthread_mutex_lock(&self->lock);
+    for (int i = 0; i < 2; i++) {
+        Track *t = &self->tracks[i];
+        if (t->set_up && t->session_id == session_id) {
+            client_track_teardown(self, i);
+            torn_down = true;
+        }
+    }
+    pthread_mutex_unlock(&self->lock);
+
+    if (!torn_down) {
+        compy_respond(ctx, COMPY_STATUS_SESSION_NOT_FOUND, "Invalid Session ID");
+        return;
+    }
+
+    compy_respond_ok(ctx);
+}
+
+static void Client_get_parameter(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+    (void)self;
+    (void)req;
+    compy_respond_ok(ctx);
+}
+
+static void Client_unknown(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+    (void)self;
+    (void)req;
+    compy_respond(ctx, COMPY_STATUS_NOT_IMPLEMENTED, "Not Implemented");
+}
+
+static Compy_ControlFlow Client_before(VSelf, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+
+    if (self->stream_id < 0) {
+        char uri_buf[256];
+        size_t uri_n = req->start_line.uri.len < sizeof uri_buf - 1 ? req->start_line.uri.len : sizeof uri_buf - 1;
+        memcpy(uri_buf, req->start_line.uri.ptr, uri_n);
+        uri_buf[uri_n] = '\0';
+        self->stream_id = strstr(uri_buf, "/sub") ? RTSP_STREAM_SUB : RTSP_STREAM_MAIN;
+    }
+
+    if (!client_check_auth(self->server, ctx, req))
+        return Compy_ControlFlow_Break;
+
+    return Compy_ControlFlow_Continue;
+}
+
+static void Client_after(VSelf, ssize_t ret, Compy_Context *ctx, const Compy_Request *req) {
+    VSELF(Client);
+    (void)self;
+    (void)ctx;
+    (void)req;
+    if (ret < 0)
+        HAL_WARNING("rtsp", "Failed to write RTSP response: %s\n", strerror(errno));
+}
+
+impl(Compy_Controller, Client);
 
 /******************************************************************************
- *              NETWORK FUNCTIONS
+ *              LIBEVENT GLUE: ACCEPT / TEARDOWN
  ******************************************************************************/
 
-static int __connection_reset(void *v)
-{
-    struct connection_item_t *p = v;
-    unsigned ctx;
+/* bufferevent only carries one callback arg shared across read/write/event
+ * callbacks; Compy's compy_libevent_cb() wants its own LibeventCtx* while
+ * on_event_cb() wants the owning Client*, so the shared arg is the Client
+ * and this trampoline forwards to Compy with the right pointer. */
+static void client_read_cb(struct bufferevent *bev, void *arg) {
+    Client *c = arg;
+    compy_libevent_cb(bev, c->libevent_ctx);
+}
 
-    if (p->con_state != __CON_S_DISCONNECTED) {
-        DBG("force connection to close\n");
+static void on_event_cb(struct bufferevent *bev, short events, void *arg) {
+    (void)bev;
+    Client *c = arg;
+
+    if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR))
+        client_unregister(c->server, c);
+}
+
+static void listener_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *sa, int socklen, void *arg) {
+    (void)listener;
+    rtsp_handle h = arg;
+
+    pthread_mutex_lock(&h->mutex);
+    bool at_capacity = h->con_num >= h->max_con;
+    pthread_mutex_unlock(&h->mutex);
+    if (at_capacity) {
+        HAL_WARNING("rtsp", "Rejecting connection: %d connections already active\n", h->max_con);
+        close(fd);
+        return;
     }
 
-    FCLOSE(p->fp_tcp_read);
-    FCLOSE(p->fp_tcp_write);
-    CLOSE(p->client_fd);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
-    p->client_fd = 0;
-    p->con_state = __CON_S_DISCONNECTED;
+    struct bufferevent *bev = bufferevent_socket_new(h->base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+    if (!bev) {
+        close(fd);
+        return;
+    }
 
-    for (int i = 0; i < sizeof(p->trans) / sizeof(*p->trans); i++) {
-        if (p->trans[i].server_rtcp_fd != 0) {
-            CLOSE(p->trans[i].server_rtcp_fd);
-            p->trans[i].server_rtcp_fd = 0;
+    Client *c = calloc(1, sizeof *c);
+    if (!c) {
+        bufferevent_free(bev);
+        return;
+    }
+    c->base = h->base;
+    c->bev = bev;
+    c->server = h;
+    c->stream_id = -1;
+    c->refcount = 1; /* table reference */
+    pthread_mutex_init(&c->lock, NULL);
+    if (socklen > 0 && (size_t)socklen <= sizeof c->addr)
+        memcpy(&c->addr, sa, (size_t)socklen);
+
+    Compy_Controller controller = DYN(Client, Compy_Controller, c);
+    c->libevent_ctx = compy_libevent_ctx(controller);
+
+    bufferevent_setcb(bev, client_read_cb, NULL, on_event_cb, c);
+    bufferevent_enable(bev, EV_READ | EV_WRITE);
+
+    pthread_mutex_lock(&h->mutex);
+    bool placed = false;
+    for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
+        if (!h->clients[i]) {
+            h->clients[i] = c;
+            h->con_num++;
+            placed = true;
+            break;
         }
-
-        if (p->trans[i].server_rtp_fd != 0) {
-            CLOSE(p->trans[i].server_rtp_fd);
-            p->trans[i].server_rtp_fd = 0;
-        }
     }
+    pthread_mutex_unlock(&h->mutex);
 
-    p->given_session_id = 0;
-    p->cseq = 0;
-
-    ctx = p->trans[0].rtp_timestamp;
-
-    /* randomize session id to avoid conflict */
-    p->session_id = __get_random_llu(&ctx);
-
-    return SUCCESS;
-}
-
-    static inline int
-__connection_list_add(bufpool_handle con_pool, struct list_head_t *head, int fd, struct sockaddr_in addr)
-{
-    DASSERT(head, return FAILURE);
-    DASSERT(fd > 0, return FAILURE);
-
-    struct connection_item_t *p = NULL;
-
-    ASSERT(bufpool_get_free(con_pool, &p) == SUCCESS, return FAILURE);
-
-    DASSERT(p, return FAILURE);
-
-    DBG("previous fd=%d\n", p->client_fd);
-
-    p->addr=addr;
-    p->client_fd=fd;
-
-    ASSERT((p->fp_tcp_read = fdopen(fd, "r")), goto error);
-    ASSERT((p->fp_tcp_write = fdopen(fd, "w")), goto error);
-
-    p->con_state = __CON_S_INIT;
-
-    return list_add(head, &(p->list_entry));
-error:
-    __connection_reset(&p->list_entry);
-    return FAILURE;
-}
-
-static inline int __find_fd_max(struct list_head_t *head)
-{
-    struct list_t *p;
-    struct connection_item_t *c;
-    int m = -1;
-    p = head->list;
-    while (p) {
-        list_upcast(c,p);
-        if (c->con_state != __CON_S_DISCONNECTED) {
-            m = max(c->client_fd, m);
-        }
-        p = p->next;
+    if (!placed) {
+        /* Raced past the capacity check above; drop it. */
+        bufferevent_free(bev);
+        compy_libevent_ctx_free(c->libevent_ctx);
+        pthread_mutex_destroy(&c->lock);
+        free(c);
     }
-    return m;
 }
 
-static inline int __set_select_sock(struct list_t *p, void *param)
-{
-    struct connection_item_t *c;
-    struct sock_select_t *socks = param;
-
-    list_upcast(c, p);
-
-    FD_SET(c->client_fd, &(socks->rfds));
-
-    return SUCCESS;
-}
-
-static inline int __bind_tcp(unsigned short port)
-{
-    int server_fd = 0;
-    struct sockaddr_in addr;
-    int tmp = 1;
-
-    /* setup serve rsocket */
-    ASSERT((server_fd = socket(AF_INET, SOCK_STREAM, 0)) > 0, ({
-                ERR("socket:%s\n", strerror(errno));
-                goto error;}));
-
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &tmp, sizeof(tmp));
-
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_family = AF_INET;
-
-    ASSERT(bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, ({
-                ERR("bind:%s\n", strerror(errno));
-                goto error;}));
-
-    ASSERT(listen(server_fd, 5) >= 0, ({
-                ERR("listen:%s\n", strerror(errno));
-                goto error;}));
-
-    /* set the socket to non-blocking */
-    fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
-
-    return server_fd;
-error:
-    if (server_fd > 0) close(server_fd);
-    return FAILURE;
-}
-
-static inline int __bind_rtp(struct connection_item_t *con )
-{
-    int server_fd = -1;
-    struct sockaddr_in addr = {};
-    int tmp;
-
-    /* reset socket */
-    if (con->trans[con->track_id].server_rtp_fd != 0) {
-        CLOSE(con->trans[con->track_id].server_rtp_fd);
-        con->trans[con->track_id].server_rtp_fd = 0;
-    }
-    /* setup serve rsocket */
-    ASSERT((server_fd = socket(AF_INET, SOCK_DGRAM, 0)) > 0, ({
-                ERR("socket:%s\n", strerror(errno));
-                goto error;}));
-
-    addr.sin_port = htons(con->trans[con->track_id].server_port_rtp);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_family = AF_INET;
-
-    tmp = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &tmp, sizeof(tmp));
-
-    ASSERT(bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, ({
-                ERR("bind:%s\n", strerror(errno));
-                goto error;}));
-
-    addr = con->addr;
-    addr.sin_port=htons(con->trans[con->track_id].client_port_rtp);
-
-    ASSERT(connect(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, ({
-                ERR("connect:%s\n", strerror(errno));
-                goto error;}));
-
-    /* set the socket to non-blocking */
-    tmp = 1;
-    ASSERT(ioctl(server_fd, FIONBIO, &tmp) != -1, ({
-                ERR("ioctl:%s\n", strerror(errno));
-                goto error;}));
-
-    con->trans[con->track_id].server_rtp_fd = server_fd;
-
-    return SUCCESS;
-error:
-    if (server_fd > 0) close(server_fd);
-    return FAILURE;
-}
-
-static inline int __bind_rtcp(struct connection_item_t *con )
-{
-    int server_fd = -1;
-    struct sockaddr_in addr = {};
-    int tmp;
-
-    /* reset socket */
-    if (con->trans[con->track_id].server_rtcp_fd != 0) {
-        CLOSE(con->trans[con->track_id].server_rtcp_fd);
-        con->trans[con->track_id].server_rtcp_fd = 0;
-    }
-
-    /* setup serve rsocket */
-    ASSERT((server_fd = socket(AF_INET, SOCK_DGRAM, 0)) > 0, ({
-                ERR("socket:%s\n", strerror(errno));
-                goto error;}));
-
-    addr.sin_port = htons(con->trans[con->track_id].server_port_rtcp);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_family = AF_INET;
-
-    tmp = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &tmp, sizeof(tmp));
-
-    ASSERT(bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, ({
-                ERR("bind:%s\n", strerror(errno));
-                goto error;}));
-
-    addr = con->addr;
-    addr.sin_port = htons(con->trans[con->track_id].client_port_rtcp);
-
-    ASSERT(connect(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, ({
-                ERR("connect:%s\n", strerror(errno));
-                goto error;}));
-
-    con->trans[con->track_id].server_rtcp_fd = server_fd;
-
-    return SUCCESS;
-error:
-    if (server_fd > 0) close(server_fd);
-    return FAILURE;
-}
-
-static inline int __accept_proc_sock(rtsp_handle h, int server_fd, struct sock_select_t *p_socks)
-{
-    unsigned int len;
-    int fd;
-    struct sockaddr_in from_addr;
-
-    if (FD_ISSET(server_fd, &p_socks->rfds) != 0) {
-        /* accept new connection */
-        len = sizeof(from_addr);
-
-        fd = accept(server_fd, (struct sockaddr *)&from_addr,
-                &len);
-
-        /* we have selected this fd, but still EAGAIN may occur */
-        if (fd < 0){
-            ASSERT(errno == EAGAIN, ({
-                        ERR("accept:%s\n",strerror(errno));
-                        return FAILURE;}));
-            return SUCCESS;
-        }
-
-        /* set server fd to non-blocking */
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-
-        /* update connection-list exclusively */
-        ASSERT(__connection_list_add(h->con_pool, &h->con_list, fd, from_addr) == SUCCESS,
-                return FAILURE);
-    }
-
-    return SUCCESS;
-}
-
-static int __connection_is_dead(struct list_t *l)
-{
-    struct connection_item_t *c;
-
-    list_upcast(c, l);
-
-    return c->con_state == __CON_S_DISCONNECTED;
+static void quit_cb(evutil_socket_t fd, short events, void *arg) {
+    (void)fd;
+    (void)events;
+    rtsp_handle h = arg;
+    event_base_loopexit(h->base, NULL);
 }
 
 /******************************************************************************
- *                  THREAD CALLBACKS
+ *              EVENT-LOOP THREAD
  ******************************************************************************/
-static void *rtspThrFxn(void *v)
-{
-    thread_handle           h = v;
-    rtsp_handle             rh = h->sharedp->param_shared;
-    void                    *status = THREAD_FAILURE;
-    struct sock_select_t    socks = {};
 
-    int     ret_select;
-    int     server_fd = -1;
+static void *rtsp_thread_fn(void *arg) {
+    rtsp_handle h = arg;
 
-    DASSERT(thread_check_isoleted_job(h) == SUCCESS, goto error);
+    evthread_use_pthreads();
 
-    /* open tcp connection */
-    ASSERT((server_fd = __bind_tcp(rh->port)) > 0, goto error);
-
-    socks.nfds = server_fd + 1;
-    socks.h_rtsp = rh;
-
-    thread_sync_init(h);
-
-    while (!gbl_get_quit(h->sharedp->gbl)) {
-        FD_ZERO(&(socks.rfds));
-        FD_SET(server_fd, &(socks.rfds));
-        socks.timeout.tv_sec = 1;
-        socks.timeout.tv_usec = 0;
-
-        ASSERT(list_map_inline(&rh->con_list, (__set_select_sock), &socks) == SUCCESS, goto error);
-
-        ASSERT((ret_select = select(socks.nfds, &(socks.rfds), NULL, NULL, &(socks.timeout))) >= 0, ({
-                    ERR("select:%s\n", strerror(errno));
-                    goto error;}));
-
-        if (ret_select > 0){
-            /* lock while tcp layer is done */
-            rtsp_lock(rh);
-
-            ASSERT(__accept_proc_sock(rh, server_fd, &socks) == SUCCESS,
-                    ({ rtsp_unlock(rh); goto error;}));
-
-            ASSERT(list_map_inline(&rh->con_list, __message_proc_sock, &socks) == SUCCESS,
-                    ({ rtsp_unlock(rh); goto error;}));
-
-            MUST(list_sweep(&rh->con_list, __connection_is_dead) == SUCCESS,
-                    ({ rtsp_unlock(rh); goto error;}));
-
-            socks.nfds = max(server_fd, __find_fd_max(&rh->con_list)) + 1;
-
-            rtsp_unlock(rh);
-        }
-        //bufpool_statistics(rh->con_pool);
+    h->base = event_base_new();
+    if (!h->base) {
+        RTSP_LOG_ERROR("rtsp", "event_base_new failed\n");
+        return NULL;
     }
 
-    status = THREAD_SUCCESS;
-error:
-    /* Make sure the other threads aren't waiting for us */
-    thread_sync_cleanup(h);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(h->port);
 
-    if (server_fd > 0) close(server_fd);
-
-    return status;
-}
-
-
-/******************************************************************************
- *              PUBLIC FUNCTIONS
- ******************************************************************************/
-void rtsp_finish(rtsp_handle h)
-{
-    /* close every connections in the handle */
-    if (h) {
-        list_destroy(&h->con_list);
-
-        if (h->pool) {
-            gbl_set_quit(h->pool->sharedp->gbl);
-
-            ASSERT(threadpool_join(h->pool) == SUCCESS, ERR("thread join with error\n"));
-
-            bufpool_delete(h->con_pool);
-            bufpool_delete(h->transfer_pool);
-
-            for (int i = 0; i < 2; i++) {
-                mime_encoded_delete(h->stream[i].sprop_vps_b64);
-                mime_encoded_delete(h->stream[i].sprop_sps_b64);
-                mime_encoded_delete(h->stream[i].sprop_sps_b16);
-                mime_encoded_delete(h->stream[i].sprop_pps_b64);
-            }
-
-            threadpool_delete(h->pool);
-        }
-
-        pthread_mutex_destroy(&h->mutex);
-
-        FREE(h);
+    h->listener = evconnlistener_new_bind(h->base, listener_cb, h,
+        LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, -1, (struct sockaddr *)&addr, sizeof addr);
+    if (!h->listener) {
+        RTSP_LOG_ERROR("rtsp", "Failed to bind RTSP port %u\n", h->port);
+        event_base_free(h->base);
+        h->base = NULL;
+        return NULL;
     }
 
-    return;
-}
+    h->quit_ev = event_new(h->base, -1, 0, quit_cb, h);
 
-rtsp_handle rtsp_create(unsigned char max_con, unsigned int port, int priority)
-{
-    rtsp_handle       nh = NULL;
+    h->started = 1;
+    event_base_dispatch(h->base);
 
-    ASSERT(max_con <= RTSP_MAXIMUM_CONNECTIONS,
-            ({ERR("maximum number of connections should be within %d\n", RTSP_MAXIMUM_CONNECTIONS);
-             return NULL;}));
+    evconnlistener_free(h->listener);
+    h->listener = NULL;
+    event_free(h->quit_ev);
+    h->quit_ev = NULL;
 
-    TALLOC(nh, return NULL);
+    /* rtsp_finish() is called before main.c stops the encoder/SDK threads
+     * (see main.c), so rtp_send_h26x()/rtp_send_mp3() can still be mid-send
+     * against a table entry while this teardown runs. Null out h->base
+     * first so any send that checks it from here on bails out immediately
+     * via its own `if (!h->base) return -1;` guard, and -- for a send that
+     * already passed that check -- decide should-free atomically with the
+     * refcount decrement, under h->mutex, exactly like client_unref() and
+     * client_unregister() do. Deciding should-free from a read of
+     * c->refcount taken *after* unlocking (as this loop used to) races a
+     * concurrent client_unref() and can double-free the same Client. */
+    struct event_base *base = h->base;
+    h->base = NULL;
 
-    nh->audioPt = 255;
-    nh->max_con = max_con;
-    nh->port = port;
-    nh->priority = priority;
+    pthread_mutex_lock(&h->mutex);
+    for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
+        Client *c = h->clients[i];
+        h->clients[i] = NULL;
+        bool should_free = false;
+        if (c) {
+            c->closing = true;
+            c->refcount--;
+            should_free = c->refcount <= 0;
+        }
+        pthread_mutex_unlock(&h->mutex);
+        if (should_free)
+            client_free(c);
+        pthread_mutex_lock(&h->mutex);
+    }
+    pthread_mutex_unlock(&h->mutex);
 
-    pthread_mutex_init(&nh->mutex,NULL);
+    event_base_free(base);
 
-    ASSERT(nh->pool = threadpool_create(nh), goto error);
-    ASSERT(nh->con_pool =  __connectionpool_create(max_con), goto error);
-    ASSERT(nh->transfer_pool =  __transpool_create(max_con), goto error);
-
-    /* create tcp thread */
-    ASSERT(CREATE_THREAD(nh->pool, rtspThrFxn, priority--, NULL),
-            goto error);
-
-    ASSERT(threadpool_start(nh->pool) == SUCCESS,
-            goto error);
-
-    srand((unsigned) time(NULL));
-
-    return nh;
-
-error:
-    rtsp_finish(nh);
     return NULL;
 }
 
-void rtsp_configure_auth(rtsp_handle h, const char *user, const char *pass)
-{
+/******************************************************************************
+ *              PUBLIC API (rtsp_server.h)
+ ******************************************************************************/
+
+rtsp_handle rtsp_create(unsigned char max_con, unsigned int port, int priority) {
+    if (max_con > RTSP_MAXIMUM_CONNECTIONS) {
+        RTSP_LOG_ERROR("rtsp", "maximum number of connections should be within %d\n", RTSP_MAXIMUM_CONNECTIONS);
+        return NULL;
+    }
+
+    rtsp_handle h = calloc(1, sizeof *h);
+    if (!h)
+        return NULL;
+
+    h->max_con = max_con;
+    h->port = (unsigned short)port;
+    h->priority = priority;
+    h->audioPt = 255;
+    pthread_mutex_init(&h->mutex, NULL);
+    for (int s = 0; s < RTSP_STREAM_COUNT; s++)
+        pthread_mutex_init(&h->stream[s].lock, NULL);
+
+    srand((unsigned)time(NULL));
+
+    if (pthread_create(&h->thread, NULL, rtsp_thread_fn, h) != 0) {
+        pthread_mutex_destroy(&h->mutex);
+        free(h);
+        return NULL;
+    }
+
+    /* Wait for the listener to come up (or fail) before returning, matching
+     * the previous module's synchronous rtsp_create() contract. */
+    for (int waited = 0; !h->started && waited < 2000; waited++)
+        usleep(1000);
+
+    return h;
+}
+
+void rtsp_configure_auth(rtsp_handle h, const char *user, const char *pass) {
+    if (!h)
+        return;
     if (user && pass) {
         h->isAuthOn = 1;
         strncpy(h->user, user, sizeof(h->user) - 1);
@@ -962,18 +992,167 @@ void rtsp_configure_auth(rtsp_handle h, const char *user, const char *pass)
     }
 }
 
-int rtsp_tick(rtsp_handle h)
-{
-    ASSERT(h, return FAILURE);
+int rtsp_tick(rtsp_handle h) {
+    /* RTP timestamps are derived from the wall clock (SysClockUs) rather
+     * than accumulated here, so there is nothing left to do periodically;
+     * kept as a no-op for API compatibility with main.c's call site. */
+    (void)h;
+    return 0;
+}
+
+void rtsp_finish(rtsp_handle h) {
+    if (!h)
+        return;
+
+    if (h->quit_ev)
+        event_active(h->quit_ev, 0, 0);
+
+    pthread_join(h->thread, NULL);
+
+    for (int s = 0; s < RTSP_STREAM_COUNT; s++)
+        pthread_mutex_destroy(&h->stream[s].lock);
+    pthread_mutex_destroy(&h->mutex);
+    free(h);
+}
+
+void rtp_disable_audio(rtsp_handle h) {
+    if (h)
+        h->audioPt = 255;
+}
+
+int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_id) {
+    if (!h || stream_id < 0 || stream_id >= RTSP_STREAM_COUNT)
+        return -1;
+    if (!h->base) /* event loop not up yet, or already torn down */
+        return -1;
+
+    for (unsigned i = 0; i < stream->count; i++) {
+        hal_vidpack *pack = &stream->pack[i];
+        stream_state_ingest(&h->stream[stream_id], isH265, pack->data + pack->offset, pack->length - pack->offset);
+    }
+
+    /* Snapshot + ref matching clients under h->mutex, then send outside the
+     * lock so a slow client can't stall the whole table. */
+    Client *targets[RTSP_MAXIMUM_CONNECTIONS];
+    int n = 0;
+
+    pthread_mutex_lock(&h->mutex);
+    for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
+        Client *c = h->clients[i];
+        if (c && !c->closing && c->stream_id == stream_id) {
+            c->refcount++;
+            targets[n++] = c;
+        }
+    }
+    pthread_mutex_unlock(&h->mutex);
+
     struct timespec ts;
-    struct timeval tv;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+    Compy_RtpTimestamp rtp_ts = Compy_RtpTimestamp_SysClockUs(now_us);
 
-    ASSERT(clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) == 0, ({
-        ERR("clock_gettime failed\n");
-        return FAILURE;}));
+    for (int ci = 0; ci < n; ci++) {
+        Client *c = targets[ci];
 
-    tv.tv_sec = ts.tv_sec;
-    tv.tv_usec = ts.tv_nsec / 1000;
+        pthread_mutex_lock(&c->lock);
+        Track *t = &c->tracks[RTSP_TRACK_VIDEO];
+        if (t->set_up && t->playing && t->nal && !Compy_NalTransport_is_full(t->nal)) {
+            for (unsigned i = 0; i < stream->count; i++) {
+                hal_vidpack *pack = &stream->pack[i];
+                uint8_t *data = pack->data + pack->offset;
+                size_t len = pack->length - pack->offset;
 
-    return __get_timestamp_offset(&h->stat, &tv);
+                U8Slice99 slice = U8Slice99_new(data, len);
+                Compy_NalStartCodeTester tester = compy_determine_start_code(slice);
+                if (!tester)
+                    continue;
+
+                while (!U8Slice99_is_empty(slice)) {
+                    size_t sc = tester(slice);
+                    if (!sc) {
+                        slice = U8Slice99_advance(slice, 1);
+                        continue;
+                    }
+                    slice = U8Slice99_advance(slice, sc);
+
+                    U8Slice99 rest = slice;
+                    size_t nal_len = 0;
+                    while (!U8Slice99_is_empty(rest) && !tester(rest)) {
+                        rest = U8Slice99_advance(rest, 1);
+                        nal_len++;
+                    }
+                    if (nal_len < 2) {
+                        slice = rest;
+                        continue;
+                    }
+
+                    Compy_NalUnit nalu;
+                    if (isH265) {
+                        nalu.header = Compy_NalHeader_H265(Compy_H265NalHeader_parse(slice.ptr));
+                        nalu.payload = U8Slice99_new(slice.ptr + 2, nal_len - 2);
+                    } else {
+                        nalu.header = Compy_NalHeader_H264(Compy_H264NalHeader_parse(slice.ptr[0]));
+                        nalu.payload = U8Slice99_new(slice.ptr + 1, nal_len - 1);
+                    }
+
+                    int send_ret __attribute__((unused)) = Compy_NalTransport_send_packet(t->nal, rtp_ts, nalu);
+
+                    slice = rest;
+                }
+            }
+        }
+        pthread_mutex_unlock(&c->lock);
+
+        client_unref(h, c);
+    }
+
+    return 0;
+}
+
+int rtp_send_mp3(rtsp_handle h, unsigned char *buf, size_t len) {
+    if (!h)
+        return -1;
+    if (!h->base)
+        return -1;
+
+    h->audioPt = RTSP_AUDIO_PAYLOAD_TYPE;
+
+    Client *targets[RTSP_MAXIMUM_CONNECTIONS];
+    int n = 0;
+
+    pthread_mutex_lock(&h->mutex);
+    for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
+        Client *c = h->clients[i];
+        if (c && !c->closing) {
+            c->refcount++;
+            targets[n++] = c;
+        }
+    }
+    pthread_mutex_unlock(&h->mutex);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+    Compy_RtpTimestamp rtp_ts = Compy_RtpTimestamp_SysClockUs(now_us);
+
+    /* RFC 2250 MPEG audio-specific header: 4 zero bytes (MBZ + fragment
+     * offset), no fragmentation since one RTP packet carries one frame. */
+    static const uint8_t mpa_header[4] = {0, 0, 0, 0};
+    U8Slice99 header = U8Slice99_new((uint8_t *)mpa_header, sizeof mpa_header);
+    U8Slice99 payload = U8Slice99_new(buf, len);
+
+    for (int ci = 0; ci < n; ci++) {
+        Client *c = targets[ci];
+
+        pthread_mutex_lock(&c->lock);
+        Track *t = &c->tracks[RTSP_TRACK_AUDIO];
+        if (t->set_up && t->playing && t->rtp && !Compy_RtpTransport_is_full(t->rtp)) {
+            int send_ret __attribute__((unused)) = Compy_RtpTransport_send_packet(t->rtp, rtp_ts, true, header, payload);
+        }
+        pthread_mutex_unlock(&c->lock);
+
+        client_unref(h, c);
+    }
+
+    return 0;
 }
