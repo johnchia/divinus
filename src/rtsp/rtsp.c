@@ -191,11 +191,15 @@ struct stream_state_t {
  *              PER-CONNECTION (CLIENT) STATE
  ******************************************************************************/
 
+struct Client;
+
 typedef struct {
     Compy_RtpTransport *rtp;
     Compy_NalTransport *nal; /* video only; NULL for audio */
     Compy_Rtcp *rtcp;
     struct event *rtcp_ev;
+    struct Client *owner; /* back-pointer for the RTCP timer callback, which
+                            * needs the owning Client to take its locks. */
     uint64_t session_id;
     bool set_up;
     bool playing;
@@ -726,7 +730,20 @@ static void Client_setup(VSelf, Compy_Context *ctx, const Compy_Request *req) {
 static void send_rtcp_sr_cb(evutil_socket_t fd, short events, void *arg) {
     (void)fd;
     (void)events;
-    int sr_ret __attribute__((unused)) = Compy_Rtcp_send_sr((Compy_Rtcp *)arg);
+    Track *t = arg;
+    Client *c = t->owner;
+
+    /* Lock order bev -> c->lock (see the note in rtp_send_h26x). Holding
+     * c->lock while building the SR serialises the read of the RtpTransport's
+     * packet/octet counters against the encoder thread that mutates them in
+     * send_packet(), which also runs under c->lock. */
+    bufferevent_lock(c->bev);
+    pthread_mutex_lock(&c->lock);
+    if (t->rtcp && t->playing) {
+        int sr_ret __attribute__((unused)) = Compy_Rtcp_send_sr(t->rtcp);
+    }
+    pthread_mutex_unlock(&c->lock);
+    bufferevent_unlock(c->bev);
 }
 
 static void Client_play(VSelf, Compy_Context *ctx, const Compy_Request *req) {
@@ -745,7 +762,8 @@ static void Client_play(VSelf, Compy_Context *ctx, const Compy_Request *req) {
         if (t->set_up && t->session_id == session_id) {
             t->playing = true;
             if (t->rtcp && !t->rtcp_ev) {
-                t->rtcp_ev = event_new(self->base, -1, EV_PERSIST | EV_TIMEOUT, send_rtcp_sr_cb, t->rtcp);
+                t->owner = self;
+                t->rtcp_ev = event_new(self->base, -1, EV_PERSIST | EV_TIMEOUT, send_rtcp_sr_cb, t);
                 if (t->rtcp_ev)
                     event_add(t->rtcp_ev, &(const struct timeval){.tv_sec = RTSP_RTCP_INTERVAL_SEC});
             }
@@ -1224,6 +1242,16 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_
     for (int ci = 0; ci < n; ci++) {
         Client *c = targets[ci];
 
+        /* Lock order: bufferevent lock BEFORE c->lock. libevent invokes the
+         * bufferevent read/event callbacks (which reach the RTSP request
+         * handlers) with the bufferevent lock held, and those handlers take
+         * c->lock -- i.e. bev -> c->lock. The send below takes c->lock and
+         * then, inside Compy's TCP transport, the bufferevent lock. Taking
+         * the bufferevent lock up-front here makes both paths acquire in the
+         * same order and avoids an AB/BA deadlock between the encoder thread
+         * and the event-loop thread. The bufferevent lock is recursive, so
+         * Compy re-locking it during the write is fine. */
+        bufferevent_lock(c->bev);
         pthread_mutex_lock(&c->lock);
         Track *t = &c->tracks[RTSP_TRACK_VIDEO];
         if (t->set_up && t->playing && t->nal) {
@@ -1253,6 +1281,7 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_
                 client_send_video_au(t, stream, isH265, rtp_ts);
         }
         pthread_mutex_unlock(&c->lock);
+        bufferevent_unlock(c->bev);
 
         client_unref(h, c);
     }
@@ -1295,12 +1324,15 @@ int rtp_send_mp3(rtsp_handle h, unsigned char *buf, size_t len) {
     for (int ci = 0; ci < n; ci++) {
         Client *c = targets[ci];
 
+        /* bev -> c->lock ordering, as in rtp_send_h26x(). */
+        bufferevent_lock(c->bev);
         pthread_mutex_lock(&c->lock);
         Track *t = &c->tracks[RTSP_TRACK_AUDIO];
         if (t->set_up && t->playing && t->rtp && !Compy_RtpTransport_is_full(t->rtp)) {
             int send_ret __attribute__((unused)) = Compy_RtpTransport_send_packet(t->rtp, rtp_ts, true, header, payload);
         }
         pthread_mutex_unlock(&c->lock);
+        bufferevent_unlock(c->bev);
 
         client_unref(h, c);
     }
