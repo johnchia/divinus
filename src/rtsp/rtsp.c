@@ -110,6 +110,14 @@
  * that's actually stalled. */
 #define RTSP_TCP_TRANSPORT_MAX_BUFFER (64 * 1024)
 
+/* Safety valve for the "skip video until the next keyframe" resync: if this
+ * many consecutive frames are skipped without a keyframe being detected, give
+ * up and resume sending. Encoder GOPs are ~15 frames, so this only trips on a
+ * real fault (keyframe-detection miss, or an encoder that stopped emitting
+ * keyframes) -- and then it merely degrades to the old send-anyway behaviour
+ * instead of freezing the client's video permanently. */
+#define RTSP_VIDEO_KF_WAIT_MAX 120
+
 #define RTSP_MAX_SDP_SIZE 2048
 
 /* RTSP_LOG_ERROR() bakes in `return EXIT_FAILURE;`, which only type-checks in
@@ -206,6 +214,16 @@ typedef struct Client {
 
     pthread_mutex_t lock; /* guards the two Track slots + refcount below */
     Track tracks[2]; /* indexed by RTSP_TRACK_VIDEO / RTSP_TRACK_AUDIO */
+
+    /* While true, video access units are skipped until the next keyframe, so
+     * the client is never handed inter-frames that reference a frame it never
+     * received. Set at SETUP (clean start at a keyframe) and whenever a video
+     * frame is dropped for backpressure; cleared once a keyframe is sent. */
+    bool video_awaiting_keyframe;
+    unsigned video_kf_wait_count; /* frames skipped while awaiting a keyframe;
+                                     a safety cap forces a resume so a keyframe
+                                     miss degrades to the old send-anyway
+                                     behaviour rather than freezing forever. */
 
     int refcount;   /* table reference (1) + one per in-flight sender */
     bool closing;
@@ -307,11 +325,37 @@ static void client_unref(rtsp_handle h, Client *c) {
         client_free(c);
 }
 
+/* Cancel both tracks' RTCP sender-report timers. MUST run on the event-loop
+ * thread: event_del()/event_free() are not safe against a concurrent
+ * event_base_dispatch() on another thread. This exists so client_unregister()
+ * can retire the timers while still on the loop thread -- otherwise the timer
+ * stays armed after the client leaves the table, and client_free() (which may
+ * run on an encoder thread via client_unref()) would event_free() it and drop
+ * t->rtcp out from under a timer callback the loop is concurrently firing: a
+ * use-after-free. Once this has run, the timer can neither fire nor be freed
+ * again (client_track_teardown() re-checks rtcp_ev for NULL). */
+static void client_cancel_rtcp_timers(Client *c) {
+    pthread_mutex_lock(&c->lock);
+    for (int i = 0; i < 2; i++) {
+        Track *t = &c->tracks[i];
+        if (t->rtcp_ev) {
+            event_del(t->rtcp_ev);
+            event_free(t->rtcp_ev);
+            t->rtcp_ev = NULL;
+        }
+    }
+    pthread_mutex_unlock(&c->lock);
+}
+
 /* Removes `c` from the live-connections table and drops the table's own
  * reference. Safe to call from the event-loop thread only (on_event_cb,
  * TEARDOWN). */
 static void client_unregister(rtsp_handle h, Client *c) {
     bool should_free = false;
+
+    /* On the loop thread: retire the RTCP timers before the client can become
+     * freeable off-thread. See client_cancel_rtcp_timers(). */
+    client_cancel_rtcp_timers(c);
 
     pthread_mutex_lock(&h->mutex);
     for (int i = 0; i < RTSP_MAXIMUM_CONNECTIONS; i++) {
@@ -617,6 +661,12 @@ static void Client_setup(VSelf, Compy_Context *ctx, const Compy_Request *req) {
         rc = setup_udp_transport(self, ctx, &transport, &rtcp_transport, config);
         break;
     default:
+        /* Not currently reachable -- compy_parse_transport() only ever yields
+         * TCP or UDP -- but respond explicitly rather than fall through to the
+         * `rc == -1` return, so a future transport type can never leave the
+         * client hanging with no response. `transport`/`rtcp_transport` are
+         * untouched on this path, so nothing to drop. */
+        compy_respond(ctx, COMPY_STATUS_UNSUPPORTED_TRANSPORT, "Unsupported transport");
         rc = -1;
         break;
     }
@@ -651,6 +701,10 @@ static void Client_setup(VSelf, Compy_Context *ctx, const Compy_Request *req) {
     if (track == RTSP_TRACK_VIDEO) {
         t->rtp = Compy_RtpTransport_new(transport, RTSP_VIDEO_PAYLOAD_TYPE, RTSP_VIDEO_CLOCK_RATE);
         t->nal = Compy_NalTransport_new(t->rtp);
+        /* Begin the stream at a keyframe so the client's decoder has a clean
+         * reference from the first frame it receives, rather than mid-GOP. */
+        self->video_awaiting_keyframe = true;
+        self->video_kf_wait_count = 0;
     } else {
         t->rtp = Compy_RtpTransport_new(transport, RTSP_AUDIO_PAYLOAD_TYPE, RTSP_AUDIO_CLOCK_RATE);
         t->nal = NULL;
@@ -1042,6 +1096,95 @@ void rtp_disable_audio(rtsp_handle h) {
         h->audioPt = 255;
 }
 
+/* Packetise and send one access unit's NAL units to a client's video track.
+ * Caller holds c->lock and has already decided this frame should go out. */
+static void client_send_video_au(Track *t, hal_vidstream *stream, bool isH265, Compy_RtpTimestamp rtp_ts) {
+    for (unsigned i = 0; i < stream->count; i++) {
+        hal_vidpack *pack = &stream->pack[i];
+        uint8_t *data = pack->data + pack->offset;
+        size_t len = pack->length - pack->offset;
+
+        U8Slice99 slice = U8Slice99_new(data, len);
+        Compy_NalStartCodeTester tester = compy_determine_start_code(slice);
+        if (!tester)
+            continue;
+
+        while (!U8Slice99_is_empty(slice)) {
+            size_t sc = tester(slice);
+            if (!sc) {
+                slice = U8Slice99_advance(slice, 1);
+                continue;
+            }
+            slice = U8Slice99_advance(slice, sc);
+
+            U8Slice99 rest = slice;
+            size_t nal_len = 0;
+            while (!U8Slice99_is_empty(rest) && !tester(rest)) {
+                rest = U8Slice99_advance(rest, 1);
+                nal_len++;
+            }
+            if (nal_len < 2) {
+                slice = rest;
+                continue;
+            }
+
+            Compy_NalUnit nalu;
+            if (isH265) {
+                nalu.header = Compy_NalHeader_H265(Compy_H265NalHeader_parse(slice.ptr));
+                nalu.payload = U8Slice99_new(slice.ptr + 2, nal_len - 2);
+            } else {
+                nalu.header = Compy_NalHeader_H264(Compy_H264NalHeader_parse(slice.ptr[0]));
+                nalu.payload = U8Slice99_new(slice.ptr + 1, nal_len - 1);
+            }
+
+            int send_ret __attribute__((unused)) = Compy_NalTransport_send_packet(t->nal, rtp_ts, nalu);
+
+            slice = rest;
+        }
+    }
+}
+
+/* True if the access unit contains a keyframe (H.264 IDR slice, or an H.265
+ * IRAP picture: BLA/IDR/CRA, NAL types 16..23) -- i.e. a point a decoder can
+ * resync from with no prior reference. Scans the Annex-B bitstream directly
+ * (rather than trusting per-HAL nalu[].type), matching the start-code logic
+ * used in the send loop below. */
+static bool stream_has_keyframe(hal_vidstream *stream, bool isH265) {
+    for (unsigned i = 0; i < stream->count; i++) {
+        hal_vidpack *pack = &stream->pack[i];
+        U8Slice99 slice = U8Slice99_new(pack->data + pack->offset, pack->length - pack->offset);
+        Compy_NalStartCodeTester tester = compy_determine_start_code(slice);
+        if (!tester)
+            continue;
+
+        while (!U8Slice99_is_empty(slice)) {
+            size_t sc = tester(slice);
+            if (!sc) {
+                slice = U8Slice99_advance(slice, 1);
+                continue;
+            }
+            slice = U8Slice99_advance(slice, sc);
+            if (U8Slice99_is_empty(slice))
+                break;
+
+            uint8_t unit_type = isH265 ? ((slice.ptr[0] >> 1) & 0x3F) : (slice.ptr[0] & 0x1F);
+            if (isH265) {
+                if (unit_type >= COMPY_H265_NAL_UNIT_BLA_W_LP && unit_type <= 23)
+                    return true;
+            } else if (unit_type == COMPY_H264_NAL_UNIT_CODED_SLICE_IDR) {
+                return true;
+            }
+
+            /* Skip to the next start code. */
+            U8Slice99 rest = slice;
+            while (!U8Slice99_is_empty(rest) && !tester(rest))
+                rest = U8Slice99_advance(rest, 1);
+            slice = rest;
+        }
+    }
+    return false;
+}
+
 int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_id) {
     if (!h || stream_id < 0 || stream_id >= RTSP_STREAM_COUNT)
         return -1;
@@ -1068,6 +1211,11 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_
     }
     pthread_mutex_unlock(&h->mutex);
 
+    if (n == 0)
+        return 0;
+
+    bool has_keyframe = stream_has_keyframe(stream, isH265);
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
@@ -1078,50 +1226,31 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265, int stream_
 
         pthread_mutex_lock(&c->lock);
         Track *t = &c->tracks[RTSP_TRACK_VIDEO];
-        if (t->set_up && t->playing && t->nal && !Compy_NalTransport_is_full(t->nal)) {
-            for (unsigned i = 0; i < stream->count; i++) {
-                hal_vidpack *pack = &stream->pack[i];
-                uint8_t *data = pack->data + pack->offset;
-                size_t len = pack->length - pack->offset;
-
-                U8Slice99 slice = U8Slice99_new(data, len);
-                Compy_NalStartCodeTester tester = compy_determine_start_code(slice);
-                if (!tester)
-                    continue;
-
-                while (!U8Slice99_is_empty(slice)) {
-                    size_t sc = tester(slice);
-                    if (!sc) {
-                        slice = U8Slice99_advance(slice, 1);
-                        continue;
-                    }
-                    slice = U8Slice99_advance(slice, sc);
-
-                    U8Slice99 rest = slice;
-                    size_t nal_len = 0;
-                    while (!U8Slice99_is_empty(rest) && !tester(rest)) {
-                        rest = U8Slice99_advance(rest, 1);
-                        nal_len++;
-                    }
-                    if (nal_len < 2) {
-                        slice = rest;
-                        continue;
-                    }
-
-                    Compy_NalUnit nalu;
-                    if (isH265) {
-                        nalu.header = Compy_NalHeader_H265(Compy_H265NalHeader_parse(slice.ptr));
-                        nalu.payload = U8Slice99_new(slice.ptr + 2, nal_len - 2);
-                    } else {
-                        nalu.header = Compy_NalHeader_H264(Compy_H264NalHeader_parse(slice.ptr[0]));
-                        nalu.payload = U8Slice99_new(slice.ptr + 1, nal_len - 1);
-                    }
-
-                    int send_ret __attribute__((unused)) = Compy_NalTransport_send_packet(t->nal, rtp_ts, nalu);
-
-                    slice = rest;
+        if (t->set_up && t->playing && t->nal) {
+            /* Decide whether to send this whole access unit. Dropping a frame
+             * corrupts every inter-frame that follows until the next keyframe,
+             * so a backpressure drop switches the client into "awaiting
+             * keyframe" mode and we keep skipping until a clean resync point
+             * rather than streaming a broken reference chain. */
+            bool send;
+            if (Compy_NalTransport_is_full(t->nal)) {
+                c->video_awaiting_keyframe = true;
+                c->video_kf_wait_count = 0;
+                send = false;
+            } else if (c->video_awaiting_keyframe) {
+                if (has_keyframe || ++c->video_kf_wait_count >= RTSP_VIDEO_KF_WAIT_MAX) {
+                    c->video_awaiting_keyframe = false;
+                    c->video_kf_wait_count = 0;
+                    send = true;
+                } else {
+                    send = false;
                 }
+            } else {
+                send = true;
             }
+
+            if (send)
+                client_send_video_au(t, stream, isH265, rtp_ts);
         }
         pthread_mutex_unlock(&c->lock);
 
