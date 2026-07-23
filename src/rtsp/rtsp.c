@@ -98,6 +98,18 @@
 
 #define RTSP_RTCP_INTERVAL_SEC 5
 
+/* Compy_TcpTransport_is_full() reports full whenever the connection's
+ * unflushed output exceeds this. TCP-interleaved video and audio share one
+ * connection/bufferevent per client, and the event-loop thread drains that
+ * buffer to the kernel asynchronously -- with a max_buffer of 0 (Compy's own
+ * example uses 0 too), *any* momentary backlog from a video send (e.g. an
+ * I-frame's worth of NAL fragments still draining) makes the very next
+ * packet on that connection -- audio included -- get silently skipped, even
+ * though the client is draining fine. A few tens of KB of slack absorbs that
+ * without meaningfully adding latency, while still tripping for a client
+ * that's actually stalled. */
+#define RTSP_TCP_TRANSPORT_MAX_BUFFER (64 * 1024)
+
 #define RTSP_MAX_SDP_SIZE 2048
 
 /* RTSP_LOG_ERROR() bakes in `return EXIT_FAILURE;`, which only type-checks in
@@ -521,7 +533,8 @@ static void Client_describe(VSelf, Compy_Context *ctx, const Compy_Request *req)
 static int setup_tcp_transport(Compy_Context *ctx, const Compy_Request *req, Compy_Transport *t, Compy_Transport *rtcp_t, Compy_TransportConfig config) {
     (void)req;
     ifLet(config.interleaved, Compy_ChannelPair_Some, interleaved) {
-        *t = compy_transport_tcp(Compy_Context_get_writer(ctx), interleaved->rtp_channel, 0);
+        *t = compy_transport_tcp(Compy_Context_get_writer(ctx), interleaved->rtp_channel,
+            RTSP_TCP_TRANSPORT_MAX_BUFFER);
         *rtcp_t = compy_transport_tcp(Compy_Context_get_writer(ctx), interleaved->rtcp_channel, 0);
 
         compy_header(ctx, COMPY_HEADER_TRANSPORT,
