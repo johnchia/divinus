@@ -229,17 +229,11 @@ void media_stop(void) {
     rtmp_close();
 }
 
-void request_idr(void) {
-    signed char index = -1;
-    pthread_mutex_lock(&chnMtx);
-    for (int i = 0; i < chnCount; i++) {
-        if (!chnState[i].enable) continue;
-        if (chnState[i].payload != HAL_VIDCODEC_H264 &&
-            chnState[i].payload != HAL_VIDCODEC_H265) continue;
-        index = i;
-        break;
-    }
-    if (index != -1) switch (plat) {
+/* Request an IDR on one specific encoder channel. Caller must hold chnMtx and
+ * must have validated that `index` refers to an enabled H.264/H.265 channel. */
+static void request_idr_index(signed char index) {
+    if (index < 0) return;
+    switch (plat) {
 #if defined(__ARM_PCS_VFP)
         case HAL_PLATFORM_I6:  i6_video_request_idr(index); break;
         case HAL_PLATFORM_I6C: i6c_video_request_idr(index); break;
@@ -258,6 +252,38 @@ void request_idr(void) {
         case HAL_PLATFORM_CVI: cvi_video_request_idr(index); break;
 #endif
     }
+}
+
+/* True if `index` is a live H.264/H.265 encoder channel. Caller holds chnMtx. */
+static bool channel_is_h26x(signed char index) {
+    return index >= 0 && index < chnCount && chnState[index].enable &&
+        (chnState[index].payload == HAL_VIDCODEC_H264 ||
+         chnState[index].payload == HAL_VIDCODEC_H265);
+}
+
+void request_idr(void) {
+    pthread_mutex_lock(&chnMtx);
+    for (int i = 0; i < chnCount; i++) {
+        if (channel_is_h26x(i)) {
+            request_idr_index(i);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&chnMtx);
+}
+
+/* Force an IDR on the encoder channel feeding a given RTSP stream: the main
+ * channel for stream 0, the substream for stream 1. Lets a freshly-connected
+ * client -- including a substream-only puller such as Frigate's detect feed --
+ * resolve its keyframe gate immediately instead of waiting a full GOP, without
+ * disturbing the other channel. Falls back to the main channel for an
+ * unresolved stream id. */
+void request_idr_stream(int stream_id) {
+    pthread_mutex_lock(&chnMtx);
+    signed char index = (stream_id == 1) ? (signed char)substream_index
+                                         : (signed char)mp4_index;
+    if (channel_is_h26x(index))
+        request_idr_index(index);
     pthread_mutex_unlock(&chnMtx);
 }
 

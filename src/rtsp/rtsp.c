@@ -80,6 +80,16 @@
 #include "../hal/macros.h"
 #include "../hal/types.h"
 
+/* media.c: force the encoder to emit an IDR now on the channel feeding a given
+ * RTSP stream (0 = main, 1 = substream), so a freshly-connected client gets a
+ * decodable keyframe within one frame instead of waiting up to a full GOP for
+ * the next scheduled one. The pre-Compy RTSP server forced an IDR at the end of
+ * its PLAY handler; the rewrite dropped it, which let a new client sit in
+ * "awaiting keyframe" long enough for ffmpeg to hit its read timeout and
+ * reconnect (a boot-time reconnect storm under Frigate). Targeting the client's
+ * own channel means a substream-only puller resyncs promptly too. */
+extern void request_idr_stream(int stream_id);
+
 /******************************************************************************
  *              DEFINITIONS
  ******************************************************************************/
@@ -776,6 +786,13 @@ static void Client_play(VSelf, Compy_Context *ctx, const Compy_Request *req) {
         compy_respond(ctx, COMPY_STATUS_SESSION_NOT_FOUND, "Invalid Session ID");
         return;
     }
+
+    /* Kick out a keyframe immediately so this client resolves its
+     * video_awaiting_keyframe gate on the next frame rather than at the next
+     * scheduled GOP boundary. Target this client's own channel so a
+     * substream-only puller (e.g. Frigate's detect feed) resyncs promptly too,
+     * rather than waiting for the substream's natural keyframe. */
+    request_idr_stream(self->stream_id);
 
     compy_header(ctx, COMPY_HEADER_RANGE, "npt=now-");
     compy_respond_ok(ctx);

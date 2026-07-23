@@ -31,6 +31,7 @@ int media_start(void);
 void media_stop(void);
 
 void request_idr(void);
+void request_idr_stream(int stream_id);
 void set_grayscale(bool active);
 int take_next_free_channel(bool mainLoop);
 
