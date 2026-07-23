@@ -24,17 +24,26 @@
  *    zero. This is a deliberately small, direct replacement for the old
  *    module's bufpool-based deferred-free scheme.
  *  - RTP timestamps use Compy_RtpTimestamp_SysClockUs (wall-clock derived),
- *    not a hand-kept per-connection timestamp accumulator. This is a
- *    simplification versus the old module's timestamp bookkeeping; the
- *    ssc30kq-specific substream pacing fixes (119dd8de, 41db8e9e) still need
- *    to be re-validated/re-derived against this new transport -- tracked as
- *    a follow-up (see distributed-gathering-walrus.md step 3), not attempted
- *    here.
+ *    not a hand-kept per-connection timestamp accumulator. Checked against
+ *    the firmware repo's ssc30kq substream pacing fixes (119dd8de/41db8e9e,
+ *    which just move the pinned Divinus commit through ffab5fb/ba9d94a/
+ *    c69b558): ffab5fb (VPE->VENC bind uses the real sensor rate instead of
+ *    the reduced output rate on both sides) and ba9d94a (lower substream
+ *    bitrate default) are HAL/config fixes below this file, already in this
+ *    branch's ancestry and untouched by the rewrite. c69b558 (3-byte
+ *    Annex-B start code support) was RTSP-layer, but its behavior is
+ *    subsumed here: compy_determine_start_code() (used throughout this
+ *    file) natively tests both the 3- and 4-byte start codes (see compy's
+ *    src/nal.c), so there is nothing left to re-derive at the code level.
+ *    Wall-clock timestamps are an intentional, arguably more correct choice
+ *    now that ffab5fb fixed the actual source of the frame-delivery
+ *    unevenness -- what remains is hardware validation (step 4), not a code
+ *    gap.
  *  - SPS/PPS/VPS extraction for sprop-parameter-sets and Basic auth are
  *    reimplemented directly (not part of Compy's public API surface for the
  *    former; Compy only ships Digest for the latter, and Basic is kept here
- *    to match current production client compatibility -- Digest upgrade is
- *    also a step-3 item).
+ *    to match current production client compatibility -- no concrete reason
+ *    to prefer Digest has come up, so this stays Basic).
  */
 
 #include "rtsp_server.h"
